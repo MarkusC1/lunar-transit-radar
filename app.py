@@ -1,7 +1,6 @@
 import math
 import time
 import os
-import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, render_template_string
@@ -81,67 +80,63 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# STABLE ADS-B INGESTION WORKER
+# GESTIÓ DE MEMÒRIA CAU SMART (COMPATIBLE AMB GUNICORN)
 # =========================================================================
-GLOBAL_STATE = {
-    'lat': 41.6079,
-    'lon': 2.2876,
-    'raw_aircraft': [],
+CACHE = {
+    'lat': 0.0,
+    'lon': 0.0,
+    'timestamp': 0.0,
+    'aircraft': [],
     'source': 'airplanes.live'
 }
-STATE_LOCK = threading.Lock()
 HTTP_SESSION = requests.Session()
 
-def fetch_feed_data(cur_lat, cur_lon):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarRadar/15.0'}
+def get_live_aircraft(cur_lat, cur_lon):
+    now = time.time()
+    # Si la memòria cau té menys de 2.5 segons i la posició és la mateixa, retornar de la RAM
+    if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
+        return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
+
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarRadar/17.0'}
     
-    # 1. Primary Open Feed
+    # 1. Intentar airplanes.live
     try:
-        url = f"https://api.airplanes.live/v2/point/{cur_lat}/{cur_lon}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=3.0)
+        url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
+        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
         if r.status_code == 200:
-            ac = r.json().get('ac', [])
-            if ac:
-                return ac, "airplanes.live"
+            data = r.json()
+            ac = data.get('ac', [])
+            if ac is not None and len(ac) > 0:
+                CACHE['lat'] = cur_lat
+                CACHE['lon'] = cur_lon
+                CACHE['timestamp'] = now
+                CACHE['aircraft'] = ac
+                CACHE['source'] = 'airplanes.live'
+                return ac, 'airplanes.live', 0.0
     except Exception:
         pass
 
-    # 2. Silent Backup Feed
+    # 2. Intentar adsb.lol com a suport
     try:
-        url = f"https://api.adsb.lol/v2/lat/{cur_lat}/lon/{cur_lon}/dist/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=3.0)
+        url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
+        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
         if r.status_code == 200:
-            ac = r.json().get('ac', [])
-            if ac:
-                return ac, "adsb.lol"
+            data = r.json()
+            ac = data.get('ac', [])
+            if ac is not None and len(ac) > 0:
+                CACHE['lat'] = cur_lat
+                CACHE['lon'] = cur_lon
+                CACHE['timestamp'] = now
+                CACHE['aircraft'] = ac
+                CACHE['source'] = 'adsb.lol'
+                return ac, 'adsb.lol', 0.0
     except Exception:
         pass
 
-    return [], "airplanes.live"
-
-def adsb_background_worker():
-    while True:
-        try:
-            with STATE_LOCK:
-                cur_lat = GLOBAL_STATE['lat']
-                cur_lon = GLOBAL_STATE['lon']
-
-            ac_list, source_name = fetch_feed_data(cur_lat, cur_lon)
-
-            with STATE_LOCK:
-                if ac_list:
-                    GLOBAL_STATE['raw_aircraft'] = ac_list
-                    GLOBAL_STATE['source'] = source_name
-        except Exception:
-            pass
-
-        time.sleep(2.5)
-
-bg_thread = threading.Thread(target=adsb_background_worker, daemon=True)
-bg_thread.start()
+    return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
 # =========================================================================
-# CORE API ENDPOINT
+# ENDPOINT PRINCIPAL
 # =========================================================================
 @app.route('/api/data')
 def get_data():
@@ -151,13 +146,10 @@ def get_data():
         alt = float(request.args.get('alt', 145.0))
         now_epoch = time.time()
 
-        with STATE_LOCK:
-            GLOBAL_STATE['lat'] = lat
-            GLOBAL_STATE['lon'] = lon
-            raw_ac = list(GLOBAL_STATE['raw_aircraft'])
-            source_feed = GLOBAL_STATE['source']
+        # Descàrrega directa garantida en el procés actiu
+        raw_ac, source_feed, cache_age_sec = get_live_aircraft(lat, lon)
 
-        # 1. Topocentric Lunar Astrometry
+        # 1. Astrometría Lunar
         t_now = ts.now()
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
         obs_loc = earth + topos_loc
@@ -173,7 +165,6 @@ def get_data():
         next_event_seconds = 0
         event_type = "SET" if moon_is_visible else "RISE"
 
-        # 2. Moonrise & Moonset Almanac
         try:
             t_search_end = ts.from_datetime(datetime.now(timezone.utc) + timedelta(hours=36))
             f_rise_set = almanac.risings_and_settings(eph, moon, topos_loc)
@@ -233,7 +224,7 @@ def get_data():
             e0, n0, u0 = ecef_to_enu(*geodetic_to_ecef(ac_lat, ac_lon, alt_m), lat, lon, alt)
             cur_az, cur_alt, cur_range = enu_to_az_alt(e0, n0, u0)
 
-            # If Moon is below horizon
+            # Si la Lluna està sota l'horitzó
             if not moon_is_visible:
                 aircraft_results.append({
                     'callsign': str(ac.get('flight') or ac.get('hex', 'UNKNOWN')).strip(),
@@ -264,7 +255,7 @@ def get_data():
                 })
                 continue
 
-            # If Moon is visible: 4D Transit Solver
+            # Si la Lluna és visible
             cur_sep = angular_separation(cur_az, cur_alt, moon_az0, moon_alt0)
 
             def evaluate_aircraft_state_at_t(t_val):
@@ -389,9 +380,9 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# WEB UI (CARTO AUTH)
+# WEB UI (RAW STRING TEMPLATE TO PREVENT PYTHON 3.12 WARNINGS)
 # =========================================================================
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -418,14 +409,13 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body class="p-2 flex flex-col h-screen overflow-hidden">
-    <!-- Header Minimalista -->
     <header class="bg-slate-900/90 backdrop-blur border border-slate-800 px-3 py-2 rounded-xl mb-1.5 flex justify-between items-center gap-2 shadow-xl">
         <div class="flex items-center gap-2.5">
             <span class="text-2xl animate-pulse">🌔</span>
             <div>
                 <div class="flex items-center gap-1.5">
                     <h1 class="text-xs font-black text-amber-400 tracking-wider">LUNAR RADAR PRO</h1>
-                    <span id="feed-badge" class="text-[8px] px-1 py-0.2 bg-emerald-950 text-emerald-300 border border-emerald-700 rounded font-bold">CARTO AUTH</span>
+                    <span id="feed-badge" class="text-[8px] px-1 py-0.2 bg-emerald-950 text-emerald-300 border border-emerald-700 rounded font-bold">ONLINE</span>
                 </div>
                 <span id="moon-horizon-status" class="text-[10px] text-slate-400 font-bold">Computing ephemerides...</span>
             </div>
@@ -495,7 +485,7 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- MODAL AJUSTES -->
+    <!-- MODAL SETTINGS -->
     <div id="settings-modal" class="fixed inset-0 z-[2000] bg-black/70 backdrop-blur-sm hidden items-center justify-center p-4">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl p-4 max-w-sm w-full shadow-2xl flex flex-col gap-3">
             <div class="flex justify-between items-center border-b border-slate-800 pb-2">
@@ -598,7 +588,6 @@ HTML_TEMPLATE = """
         const planesState = {};
         let activeAircraftData = [];
 
-        // Clave oficial CARTO
         const CARTO_KEY = 'cb1_2l65_1_3a8e83de8b889ec5e4e98278';
 
         map = L.map('map', { preferCanvas: true }).setView([observerLat, observerLon], 10);
