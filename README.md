@@ -1,5 +1,7 @@
 # 🌕 Lunar Transit Radar PRO
 
+[![Live Demo](https://img.shields.io/badge/Live%20Radar-lunar--transit--radar.onrender.com-00C7B7?style=for-the-badge&logo=render&logoColor=white)](https://lunar-transit-radar.onrender.com/)
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
 ![Flask](https://img.shields.io/badge/Framework-Flask-black?logo=flask)
 ![NASA JPL](https://img.shields.io/badge/Astrometry-NASA%20JPL%20DE421-orange)
@@ -69,11 +71,10 @@ When targeting a lunar aircraft transit:
 
 | Parameter | Recommended Setting |
 | :--- | :--- |
-| **Shutter Speed** | `1/500s` to `1/2000s` (freezes aircraft motion at 900 km/h) |
-| **Aperture** | `f/8` - `f/11` (sharpest optical sweet spot for telephotos) |
-| **ISO** | `100` - `400` (low noise, base sensor ISO) |
-| **Drive Mode** | Continuous High-Speed Burst (> 10 fps) |
-| **Timing** | Start continuous burst at **`T-00:02`** on the live radar timer |
+| **Shutter Speed** | `1/500s` to `1/2000s` (freezes aircraft motion) |
+| **Aperture** | `f/6` - `f/11` (sharpest optical sweet spot for telephotos) |
+| **ISO** | `100` - `400` (low noise, the lowest ISO possible) |
+| **Drive Mode** | Continuous High-Speed Burst  |
 
 ---
 
