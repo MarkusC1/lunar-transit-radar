@@ -138,6 +138,11 @@ def get_live_aircraft(cur_lat, cur_lon):
 # =========================================================================
 # ENDPOINT PRINCIPAL
 # =========================================================================
+
+@app.route('/google92a4c5b46b2ec0bf.html')
+def google_verification():
+    return 'google-site-verification: google92a4c5b46b2ec0bf.html'
+
 @app.route('/api/data')
 def get_data():
     try:
