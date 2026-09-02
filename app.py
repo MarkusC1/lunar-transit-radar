@@ -44,6 +44,10 @@ def calculate_atmosphere(alt_m):
     t_c = 15.0 - (0.0065 * alt_m)
     return max(300.0, p_mbar), t_c
 
+def diff_angle_deg(a, b):
+    """Diferencia angular modular correcta para evitar errores en 0/360 deg"""
+    return (a - b + 180.0) % 360.0 - 180.0
+
 def geodetic_to_ecef(lat_deg, lon_deg, h_m):
     lat, lon = math.radians(lat_deg), math.radians(lon_deg)
     n = WGS84_A / math.sqrt(1.0 - WGS84_E2 * (math.sin(lat) ** 2))
@@ -110,7 +114,7 @@ def get_live_aircraft(cur_lat, cur_lon):
     if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
         return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/22.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/23.0'}
     
     # 1. airplanes.live
     try:
@@ -182,7 +186,7 @@ def get_data():
         sun_radius_deg = float(math.degrees(math.asin(SUN_RADIUS_KM / s_dist.km)))
         sun_is_visible = bool(sun_alt0 > -0.5)
 
-        # Derivadas de posición a 300s
+        # Derivadas angulares continuas con corrección de wrap-around (300s)
         dt_future = datetime.now(timezone.utc) + timedelta(seconds=300)
         t_300 = ts.from_datetime(dt_future)
         
@@ -190,14 +194,14 @@ def get_data():
         if moon_is_visible:
             app_m300 = obs_loc.at(t_300).observe(moon).apparent()
             ma300, mz300, _ = app_m300.altaz(pressure_mbar=p_mbar, temperature_C=t_c)
-            d_az_dt_moon = (float(mz300.degrees) - moon_az0) / 300.0
+            d_az_dt_moon = diff_angle_deg(float(mz300.degrees), moon_az0) / 300.0
             d_alt_dt_moon = (float(ma300.degrees) - moon_alt0) / 300.0
 
         d_az_dt_sun, d_alt_dt_sun = 0.0, 0.0
         if sun_is_visible:
             app_s300 = obs_loc.at(t_300).observe(sun).apparent()
             sa300, sz300, _ = app_s300.altaz(pressure_mbar=p_mbar, temperature_C=t_c)
-            d_az_dt_sun = (float(sz300.degrees) - sun_az0) / 300.0
+            d_az_dt_sun = diff_angle_deg(float(sz300.degrees), sun_az0) / 300.0
             d_alt_dt_sun = (float(sa300.degrees) - sun_alt0) / 300.0
 
         # Salida / Puesta de Luna y Sol
@@ -220,7 +224,6 @@ def get_data():
         moon_ev_type, moon_ev_str, moon_ev_sec = get_next_event(moon, moon_is_visible)
         sun_ev_type, sun_ev_str, sun_ev_sec = get_next_event(sun, sun_is_visible)
 
-        # 3. Procesamiento de aeronaves
         aircraft_results = []
 
         for ac in raw_ac:
@@ -250,6 +253,7 @@ def get_data():
             e0, n0, u0 = ecef_to_enu(*geodetic_to_ecef(ac_lat, ac_lon, alt_m), lat, lon, alt)
             cur_az, cur_alt, cur_range = enu_to_az_alt(e0, n0, u0)
 
+            # Optimización TCA por Sección Áurea
             def compute_body_intercept(body_type, b_az0, b_alt0, b_rad, d_az, d_alt, is_vis):
                 if not is_vis:
                     return {
@@ -272,32 +276,56 @@ def get_data():
                     et, nt, ut = ecef_to_enu(*geodetic_to_ecef(p_lat, p_lon, p_alt_m), lat, lon, alt)
                     p_az, p_alt, p_range = enu_to_az_alt(et, nt, ut)
                     if p_alt <= 0: return 999.0, p_az, p_alt, p_range
-                    b_az_t = b_az0 + d_az * t_val
+                    b_az_t = (b_az0 + d_az * t_val) % 360.0
                     b_alt_t = b_alt0 + d_alt * t_val
                     return angular_separation(p_az, p_alt, b_az_t, b_alt_t), p_az, p_alt, p_range
 
+                # Fase 1: Barrido global (Paso 2.0s de 0 a 300s)
                 best_t = 0.0
                 min_sep = cur_sep
                 best_p_alt, best_p_range, best_b_alt = cur_alt, cur_range, b_alt0
 
-                for step in range(1, 101):
-                    t_cand = float(step * 3)
+                for step in range(0, 151):
+                    t_cand = float(step * 2.0)
                     sep_val, p_az, p_alt, p_range = eval_t(t_cand)
                     if sep_val < min_sep:
                         min_sep, best_t = sep_val, t_cand
                         best_p_alt, best_p_range = p_alt, p_range
                         best_b_alt = b_alt0 + d_alt * t_cand
 
-                if best_t > 0:
-                    t_start = max(0.0, best_t - 3.0)
-                    t_end = min(300.0, best_t + 3.0)
-                    for f in range(int((t_end - t_start) / 0.1) + 1):
-                        t_cand = t_start + (f * 0.1)
-                        sep_val, p_az, p_alt, p_range = eval_t(t_cand)
-                        if sep_val < min_sep:
-                            min_sep, best_t = sep_val, t_cand
-                            best_p_alt, best_p_range = p_alt, p_range
-                            best_b_alt = b_alt0 + d_alt * t_cand
+                # Fase 2: Optimización por Sección Áurea (Golden Section Search a 3 milisegundos)
+                a = max(0.0, best_t - 2.5)
+                b = min(300.0, best_t + 2.5)
+                phi = (1.0 + math.sqrt(5.0)) / 2.0
+                resphi = 2.0 - phi
+
+                x1 = a + resphi * (b - a)
+                x2 = b - resphi * (b - a)
+                f1, _, _, _ = eval_t(x1)
+                f2, _, _, _ = eval_t(x2)
+
+                for _ in range(14):
+                    if f1 < f2:
+                        b = x2
+                        x2 = x1
+                        f2 = f1
+                        x1 = a + resphi * (b - a)
+                        f1, _, _, _ = eval_t(x1)
+                    else:
+                        a = x1
+                        x1 = x2
+                        f1 = f2
+                        x2 = b - resphi * (b - a)
+                        f2, _, _, _ = eval_t(x2)
+
+                t_opt = (a + b) / 2.0
+                sep_opt, _, opt_p_alt, opt_p_range = eval_t(t_opt)
+                if sep_opt < min_sep:
+                    min_sep = sep_opt
+                    best_t = t_opt
+                    best_p_alt = opt_p_alt
+                    best_p_range = opt_p_range
+                    best_b_alt = b_alt0 + d_alt * t_opt
 
                 vert_offset_deg = round(best_p_alt - best_b_alt, 3)
                 body_diam_deg = 2.0 * b_rad
@@ -357,7 +385,7 @@ def get_data():
             moon_data = compute_body_intercept('moon', moon_az0, moon_alt0, moon_radius_deg, d_az_dt_moon, d_alt_dt_moon, moon_is_visible)
             sun_data = compute_body_intercept('sun', sun_az0, sun_alt0, sun_radius_deg, d_az_dt_sun, d_alt_dt_sun, sun_is_visible)
 
-            # Prioridad principal por defecto: LUNA
+            # Prioridad de astro principal: LUNA
             if moon_is_visible:
                 primary = moon_data
             elif sun_is_visible:
@@ -478,6 +506,14 @@ HTML_TEMPLATE = r"""
                 <span id="sun-coords" class="text-amber-300 font-bold text-[11px]">Sun: Az --° | Alt --°</span>
                 <span id="sun-badge" class="text-[9px] px-1 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono">--:--</span>
             </div>
+
+            <div class="hidden sm:flex bg-slate-950 px-2 py-1 rounded-lg border border-slate-800 items-center gap-1.5">
+                <span id="obs-coords" class="text-cyan-400 font-bold text-[11px]">41.6079, 2.2876</span>
+                <span id="obs-alt-badge" class="text-emerald-300 font-bold text-[11px]">⛰️ 145m</span>
+                <button id="lock-btn" onclick="toggleLocationLock()" class="text-[10px] px-1 bg-slate-900 hover:bg-slate-800 text-slate-300 rounded border border-slate-700 font-bold transition">
+                    🔒
+                </button>
+            </div>
         </div>
 
         <!-- TARGET MODE SWITCH & TOOLS -->
@@ -591,7 +627,8 @@ HTML_TEMPLATE = r"""
         let buildingOffsetM = savedBuilding ? parseFloat(savedBuilding) : 0.0;
         let timingCalibrationSec = savedCalib ? parseFloat(savedCalib) : 0.0;
 
-        let activeFilter = 'moon'; // 'moon', 'sun', 'all'
+        let activeFilter = 'moon';
+        let isLocationLocked = true;
         let serverClockDelta = 0.0;
         let audioEnabled = false;
         let voiceEnabled = false;
@@ -658,6 +695,27 @@ HTML_TEMPLATE = r"""
             const pos = e.target.getLatLng();
             saveAndSetObserverPos(pos.lat, pos.lng);
         });
+
+        map.on('click', function(e) {
+            if (!isLocationLocked) {
+                obsMarker.setLatLng(e.latlng);
+                saveAndSetObserverPos(e.latlng.lat, e.latlng.lng);
+            }
+        });
+
+        function toggleLocationLock() {
+            isLocationLocked = !isLocationLocked;
+            const btn = document.getElementById('lock-btn');
+            if (isLocationLocked) {
+                obsMarker.dragging.disable();
+                btn.innerText = "🔒";
+                btn.className = "text-[10px] px-1 bg-slate-900 hover:bg-slate-800 text-slate-300 rounded border border-slate-700 font-bold transition";
+            } else {
+                obsMarker.dragging.enable();
+                btn.innerText = "🔓";
+                btn.className = "text-[10px] px-1 bg-amber-600 text-white rounded font-bold transition animate-pulse";
+            }
+        }
 
         function setFilterMode(mode) {
             activeFilter = mode;
@@ -750,13 +808,22 @@ HTML_TEMPLATE = r"""
                 const data = await res.json();
                 if (data.elevation && data.elevation.length > 0) {
                     terrainElevationM = parseFloat(data.elevation[0]);
+                    updateAltitudeDisplay();
                 }
-            } catch (e) {}
+            } catch (e) {
+                updateAltitudeDisplay();
+            }
+        }
+
+        function updateAltitudeDisplay() {
+            const totalAlt = terrainElevationM + buildingOffsetM;
+            document.getElementById('obs-alt-badge').innerText = `⛰️ ${totalAlt.toFixed(0)}m`;
         }
 
         function updateBuildingOffset(val) {
             buildingOffsetM = Math.max(0, parseFloat(val) || 0);
             localStorage.setItem('obs_building_m', buildingOffsetM.toString());
+            updateAltitudeDisplay();
             fetchData();
         }
 
@@ -770,6 +837,7 @@ HTML_TEMPLATE = r"""
             observerLat = lat; observerLon = lon;
             localStorage.setItem('obs_lat', lat.toString());
             localStorage.setItem('obs_lon', lon.toString());
+            document.getElementById('obs-coords').innerText = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
             fetchTerrainElevation(lat, lon);
             renderAstroVectors();
             fetchData();
@@ -799,7 +867,7 @@ HTML_TEMPLATE = r"""
             const showMoon = (activeFilter === 'all' || activeFilter === 'moon') && moonDataGlobal.visible;
             const showSun = (activeFilter === 'all' || activeFilter === 'sun') && sunDataGlobal.visible;
 
-            // 1. Vector Lunar (Principal)
+            // 1. Vector Lunar
             if (showMoon) {
                 const radAzM = (moonDataGlobal.azimuth * Math.PI) / 180;
                 const endM = [
@@ -821,7 +889,7 @@ HTML_TEMPLATE = r"""
                 if (moonIconMarker) { map.removeLayer(moonIconMarker); moonIconMarker = null; }
             }
 
-            // 2. Vector Solar (Secundario)
+            // 2. Vector Solar
             if (showSun) {
                 const radAzS = (sunDataGlobal.azimuth * Math.PI) / 180;
                 const endS = [
@@ -864,7 +932,6 @@ HTML_TEMPLATE = r"""
                     document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
                 }
 
-                // Actualizar badges superiores
                 document.getElementById('moon-coords').innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
                 document.getElementById('moon-badge').innerText = `${moonDataGlobal.event_type}: ${moonDataGlobal.next_event_str}`;
 
@@ -1062,6 +1129,7 @@ HTML_TEMPLATE = r"""
         document.getElementById('calib-slider').value = timingCalibrationSec.toString();
         document.getElementById('calib-val').innerText = (timingCalibrationSec >= 0 ? '+' : '') + timingCalibrationSec.toFixed(1) + 's';
         document.getElementById('building-offset').value = buildingOffsetM.toString();
+        document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
 
         fetchData();
         fetchTerrainElevation(observerLat, observerLon);
@@ -1076,8 +1144,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO - SERVER ONLINE")
-    print(f" [OK] Google Verification Endpoint Active")
-    print(f" [OK] Port: {port}")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO - MAXIMUM PRECISION ENGINE ACTIVE")
+    print(f" [OK] Golden-Section TCA Optimizer & Refraction Corrected")
+    print(f" [OK] Google Verification: /google92a4c5b46b2ec0bf.html")
+    print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
