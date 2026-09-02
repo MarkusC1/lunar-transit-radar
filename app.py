@@ -114,7 +114,7 @@ def get_live_aircraft(cur_lat, cur_lon):
     if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
         return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/23.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/24.0'}
     
     # 1. airplanes.live
     try:
@@ -280,7 +280,6 @@ def get_data():
                     b_alt_t = b_alt0 + d_alt * t_val
                     return angular_separation(p_az, p_alt, b_az_t, b_alt_t), p_az, p_alt, p_range
 
-                # Fase 1: Barrido global (Paso 2.0s de 0 a 300s)
                 best_t = 0.0
                 min_sep = cur_sep
                 best_p_alt, best_p_range, best_b_alt = cur_alt, cur_range, b_alt0
@@ -293,7 +292,7 @@ def get_data():
                         best_p_alt, best_p_range = p_alt, p_range
                         best_b_alt = b_alt0 + d_alt * t_cand
 
-                # Fase 2: Optimización por Sección Áurea (Golden Section Search a 3 milisegundos)
+                # Optimización fina por Sección Áurea (Golden Section Search)
                 a = max(0.0, best_t - 2.5)
                 b = min(300.0, best_t + 2.5)
                 phi = (1.0 + math.sqrt(5.0)) / 2.0
@@ -385,7 +384,6 @@ def get_data():
             moon_data = compute_body_intercept('moon', moon_az0, moon_alt0, moon_radius_deg, d_az_dt_moon, d_alt_dt_moon, moon_is_visible)
             sun_data = compute_body_intercept('sun', sun_az0, sun_alt0, sun_radius_deg, d_az_dt_sun, d_alt_dt_sun, sun_is_visible)
 
-            # Prioridad de astro principal: LUNA
             if moon_is_visible:
                 primary = moon_data
             elif sun_is_visible:
@@ -457,6 +455,18 @@ HTML_TEMPLATE = r"""
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="google-site-verification" content="google92a4c5b46b2ec0bf" />
+    
+    <!-- SEO & META DESCRIPCIÓN PARA GOOGLE -->
+    <meta name="description" content="Lunar Transit Radar PRO: Radar en tiempo real para predicción y seguimiento de tránsitos de aeronaves frente a la Luna y el Sol. Astrometría NASA JPL DE421 y telemetría 4D. Creado por Marc Garrido.">
+    <meta name="keywords" content="lunar transit radar, transito lunar avion, solar transit radar, astrofotografia, marc garrido, radar aviones luna">
+    <meta name="author" content="Marc Garrido">
+    
+    <!-- OPEN GRAPH / REDES SOCIALES -->
+    <meta property="og:title" content="Lunar Transit Radar PRO">
+    <meta property="og:description" content="Predicción en tiempo real de tránsitos de aeronaves frente a la Luna y el Sol con astrometría NASA JPL DE421. Creado por Marc Garrido.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://lunar-transit-radar.onrender.com/">
+    
     <title>Lunar Transit Radar PRO</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -524,6 +534,9 @@ HTML_TEMPLATE = r"""
                 <button id="btn-flt-all" onclick="setFilterMode('all')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-white">Dual</button>
             </div>
 
+            <button onclick="toggleAboutModal()" class="bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 border border-indigo-700/80 text-xs px-2 py-1.5 rounded-lg font-bold transition" title="Acerca de">
+                ℹ️
+            </button>
             <button id="voice-btn" onclick="toggleVoice()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition" title="Voice Alerts">
                 🗣️
             </button>
@@ -576,6 +589,45 @@ HTML_TEMPLATE = r"""
             
             <div id="alerts-container" class="flex flex-col gap-1.5 overflow-y-auto">
                 <div class="text-xs text-slate-500 text-center py-8">Tracking lunar intercept traffic...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: ACERCA DE (ABOUT / AUTORÍA) -->
+    <div id="about-modal" class="fixed inset-0 z-[2000] bg-black/80 backdrop-blur-md hidden items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl p-5 max-w-lg w-full shadow-2xl flex flex-col gap-3.5">
+            <div class="flex justify-between items-center border-b border-slate-800 pb-2">
+                <div>
+                    <h3 class="font-black text-base text-amber-400">ℹ️ Acerca de Lunar Transit Radar PRO</h3>
+                    <p class="text-[10px] text-slate-400">Astrometría NASA JPL DE421 & Cinemática de Tránsitos 4D</p>
+                </div>
+                <button onclick="toggleAboutModal()" class="text-slate-400 hover:text-white font-bold text-lg">✕</button>
+            </div>
+
+            <div class="text-xs text-slate-300 flex flex-col gap-3 leading-relaxed">
+                <!-- TARJETA DEL CREADOR -->
+                <div class="bg-gradient-to-r from-amber-950/70 via-slate-950 to-slate-950 p-3.5 rounded-xl border border-amber-600/60 flex items-center justify-between shadow-lg">
+                    <div>
+                        <span class="text-[10px] text-amber-400 font-black uppercase tracking-wider block mb-0.5">👨‍💻 Creador & Desarrollador</span>
+                        <span class="text-sm font-black text-white tracking-wide">Marc Garrido</span>
+                    </div>
+                    <span class="text-2xl">🚀</span>
+                </div>
+
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                    <h4 class="font-bold text-cyan-400 mb-1">📐 Motor Astrométrico & Geodésico</h4>
+                    <ul class="list-disc pl-4 space-y-1 text-[11px] text-slate-400">
+                        <li><b>Efemérides:</b> NASA JPL DE421 con paralaje topocéntrico y refracción ISA.</li>
+                        <li><b>Geodesia:</b> WGS84 Elipsoidal ($\text{ECEF} \to \text{ENU}$).</li>
+                        <li><b>Optimización TCA:</b> Búsqueda de Sección Áurea a $\pm 3\text{ ms}$.</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="text-right pt-2 border-t border-slate-800">
+                <button onclick="toggleAboutModal()" class="bg-slate-800 hover:bg-slate-700 text-xs text-white px-4 py-1.5 rounded-lg font-bold">
+                    Cerrar
+                </button>
             </div>
         </div>
     </div>
@@ -715,6 +767,12 @@ HTML_TEMPLATE = r"""
                 btn.innerText = "🔓";
                 btn.className = "text-[10px] px-1 bg-amber-600 text-white rounded font-bold transition animate-pulse";
             }
+        }
+
+        function toggleAboutModal() {
+            const m = document.getElementById('about-modal');
+            m.classList.toggle('hidden');
+            m.classList.toggle('flex');
         }
 
         function setFilterMode(mode) {
@@ -1144,9 +1202,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO - MAXIMUM PRECISION ENGINE ACTIVE")
-    print(f" [OK] Golden-Section TCA Optimizer & Refraction Corrected")
-    print(f" [OK] Google Verification: /google92a4c5b46b2ec0bf.html")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO - BY MARC GARRIDO")
+    print(f" [OK] Maximum Precision Engine & Google SEO Meta Active")
+    print(f" [OK] Verification: /google92a4c5b46b2ec0bf.html")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
