@@ -9,17 +9,23 @@ from skyfield.api import load, wgs84
 
 app = Flask(__name__)
 
+# =========================================================================
 # 1. NASA JPL Planetary Ephemeris
+# =========================================================================
 ts = load.timescale()
 eph = load('de421.bsp')
+sun = eph['sun']
 moon = eph['moon']
 earth = eph['earth']
 
-# 2. WGS84 Geodetic Constants
+# Constantes físicas y geodésicas WGS84
 WGS84_A = 6378137.0
 WGS84_F = 1.0 / 298.257223563
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
 R_EARTH = 6371000.0
+
+SUN_RADIUS_KM = 696340.0
+MOON_RADIUS_KM = 1737.4
 
 WINGSPANS = {
     'A318': 34.1, 'A319': 35.8, 'A320': 35.8, 'A321': 35.8,
@@ -80,7 +86,7 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# GESTIÓ DE MEMÒRIA CAU SMART (COMPATIBLE AMB GUNICORN)
+# GESTIÓN DE MEMORIA CACHÉ SMART (COMPATIBLE CON GUNICORN)
 # =========================================================================
 CACHE = {
     'lat': 0.0,
@@ -93,13 +99,12 @@ HTTP_SESSION = requests.Session()
 
 def get_live_aircraft(cur_lat, cur_lon):
     now = time.time()
-    # Si la memòria cau té menys de 2.5 segons i la posició és la mateixa, retornar de la RAM
     if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
         return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarRadar/17.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AstronomicalRadar/18.0'}
     
-    # 1. Intentar airplanes.live
+    # 1. airplanes.live
     try:
         url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
         r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
@@ -116,7 +121,7 @@ def get_live_aircraft(cur_lat, cur_lon):
     except Exception:
         pass
 
-    # 2. Intentar adsb.lol com a suport
+    # 2. adsb.lol de respaldo
     try:
         url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
         r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
@@ -136,54 +141,89 @@ def get_live_aircraft(cur_lat, cur_lon):
     return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
 # =========================================================================
-# ENDPOINT PRINCIPAL
+# ENDPOINT PRINCIPAL (SOPORTA SOL, LUNA Y MODO AUTO)
 # =========================================================================
-
-@app.route('/google92a4c5b46b2ec0bf.html')
-def google_verification():
-    return 'google-site-verification: google92a4c5b46b2ec0bf.html'
-
 @app.route('/api/data')
 def get_data():
     try:
         lat = float(request.args.get('lat', 41.6079))
         lon = float(request.args.get('lon', 2.2876))
         alt = float(request.args.get('alt', 145.0))
+        target_req = request.args.get('target', 'auto').lower()
         now_epoch = time.time()
 
-        # Descàrrega directa garantida en el procés actiu
         raw_ac, source_feed, cache_age_sec = get_live_aircraft(lat, lon)
 
-        # 1. Astrometría Lunar
         t_now = ts.now()
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
         obs_loc = earth + topos_loc
         
-        app_now = obs_loc.at(t_now).observe(moon).apparent()
-        m_alt0, m_az0, m_dist0 = app_now.altaz()
+        # 1. Cálculo Astrométrico de Luna y Sol
+        app_moon = obs_loc.at(t_now).observe(moon).apparent()
+        m_alt0, m_az0, m_dist0 = app_moon.altaz()
         moon_az0 = float(m_az0.degrees)
         moon_alt0 = float(m_alt0.degrees)
-        moon_radius_deg = float(math.degrees(math.asin(1737.4 / m_dist0.km)))
+        moon_radius_deg = float(math.degrees(math.asin(MOON_RADIUS_KM / m_dist0.km)))
 
+        app_sun = obs_loc.at(t_now).observe(sun).apparent()
+        s_alt0, s_az0, s_dist0 = app_sun.altaz()
+        sun_az0 = float(s_az0.degrees)
+        sun_alt0 = float(s_alt0.degrees)
+        sun_radius_deg = float(math.degrees(math.asin(SUN_RADIUS_KM / s_dist0.km)))
+
+        sun_is_visible = bool(sun_alt0 > 0)
         moon_is_visible = bool(moon_alt0 > 0)
+
+        # 2. Selección del cuerpo activo (Sol o Luna)
+        if target_req == 'sun':
+            active_target = 'sun'
+        elif target_req == 'moon':
+            active_target = 'moon'
+        else: # 'auto'
+            if sun_is_visible:
+                active_target = 'sun'
+            elif moon_is_visible:
+                active_target = 'moon'
+            else:
+                # Si ambos están bajo el horizonte, tomar el que esté más cerca de salir
+                active_target = 'sun' if sun_alt0 > moon_alt0 else 'moon'
+
+        if active_target == 'sun':
+            body_obj = sun
+            body_name = "Sun"
+            body_symbol = "☀️"
+            body_az0 = sun_az0
+            body_alt0 = sun_alt0
+            body_radius_deg = sun_radius_deg
+            body_is_visible = sun_is_visible
+        else:
+            body_obj = moon
+            body_name = "Moon"
+            body_symbol = "🌕"
+            body_az0 = moon_az0
+            body_alt0 = moon_alt0
+            body_radius_deg = moon_radius_deg
+            body_is_visible = moon_is_visible
+
+        # 3. Cálculo de salida / puesta del astro activo
         next_event_str = "--:--"
         next_event_seconds = 0
-        event_type = "SET" if moon_is_visible else "RISE"
+        event_type = "SET" if body_is_visible else "RISE"
 
         try:
             t_search_end = ts.from_datetime(datetime.now(timezone.utc) + timedelta(hours=36))
-            f_rise_set = almanac.risings_and_settings(eph, moon, topos_loc)
+            f_rise_set = almanac.risings_and_settings(eph, body_obj, topos_loc)
             times_rs, events_rs = almanac.find_discrete(t_now, t_search_end, f_rise_set)
 
             now_utc = datetime.now(timezone.utc)
             for t_e, ev in zip(times_rs, events_rs):
                 dt_e = t_e.utc_datetime()
-                if moon_is_visible and ev == 0:
+                if body_is_visible and ev == 0:
                     event_type = "SET"
                     next_event_str = dt_e.strftime('%H:%M UTC')
                     next_event_seconds = max(0, int((dt_e - now_utc).total_seconds()))
                     break
-                elif not moon_is_visible and ev == 1:
+                elif not body_is_visible and ev == 1:
                     event_type = "RISE"
                     next_event_str = dt_e.strftime('%H:%M UTC')
                     next_event_seconds = max(0, int((dt_e - now_utc).total_seconds()))
@@ -191,17 +231,18 @@ def get_data():
         except Exception:
             pass
 
+        # Derivadas de posición del astro
         d_az_dt, d_alt_dt = 0.0, 0.0
-        if moon_is_visible:
+        if body_is_visible:
             dt_future = datetime.now(timezone.utc) + timedelta(seconds=300)
             t_300 = ts.from_datetime(dt_future)
-            app_300 = obs_loc.at(t_300).observe(moon).apparent()
-            m_alt300, m_az300, _ = app_300.altaz()
-            d_az_dt = (float(m_az300.degrees) - moon_az0) / 300.0
-            d_alt_dt = (float(m_alt300.degrees) - moon_alt0) / 300.0
+            app_300 = obs_loc.at(t_300).observe(body_obj).apparent()
+            b_alt300, b_az300, _ = app_300.altaz()
+            d_az_dt = (float(b_az300.degrees) - body_az0) / 300.0
+            d_alt_dt = (float(b_alt300.degrees) - body_alt0) / 300.0
 
         aircraft_results = []
-        lunar_diameter_deg = 2.0 * moon_radius_deg
+        body_diameter_deg = 2.0 * body_radius_deg
 
         for ac in raw_ac:
             raw_lat = ac.get('lat')
@@ -229,8 +270,8 @@ def get_data():
             e0, n0, u0 = ecef_to_enu(*geodetic_to_ecef(ac_lat, ac_lon, alt_m), lat, lon, alt)
             cur_az, cur_alt, cur_range = enu_to_az_alt(e0, n0, u0)
 
-            # Si la Lluna està sota l'horitzó
-            if not moon_is_visible:
+            # Si el astro está bajo el horizonte
+            if not body_is_visible:
                 aircraft_results.append({
                     'callsign': str(ac.get('flight') or ac.get('hex', 'UNKNOWN')).strip(),
                     'model': model_icao,
@@ -249,19 +290,19 @@ def get_data():
                     'min_sep': 99.0,
                     'vertical_offset_deg': 0.0,
                     'vertical_offset_m': 0,
-                    'vertical_lunar_diams': 0.0,
+                    'vertical_body_diams': 0.0,
                     'vertical_dir_text': '',
                     'tca_seconds': 0.0,
                     'tca_epoch': float(now_epoch),
                     'transit_duration_s': 0.0,
-                    'position_descriptor': "Moon Below Horizon",
+                    'position_descriptor': f"{body_name} Below Horizon",
                     'is_transit': False,
                     'is_close': False
                 })
                 continue
 
-            # Si la Lluna és visible
-            cur_sep = angular_separation(cur_az, cur_alt, moon_az0, moon_alt0)
+            # Si el astro es visible en el cielo
+            cur_sep = angular_separation(cur_az, cur_alt, body_az0, body_alt0)
 
             def evaluate_aircraft_state_at_t(t_val):
                 p_lat, p_lon = propagate_geodetic_position(ac_lat, ac_lon, speed_ms, track_val, t_val)
@@ -269,16 +310,16 @@ def get_data():
                 et, nt, ut = ecef_to_enu(*geodetic_to_ecef(p_lat, p_lon, p_alt_m), lat, lon, alt)
                 p_az, p_alt, p_range = enu_to_az_alt(et, nt, ut)
                 if p_alt <= 0: return 999.0, p_az, p_alt, p_range
-                m_az_t = moon_az0 + d_az_dt * t_val
-                m_alt_t = moon_alt0 + d_alt_dt * t_val
-                sep = angular_separation(p_az, p_alt, m_az_t, m_alt_t)
+                b_az_t = body_az0 + d_az_dt * t_val
+                b_alt_t = body_alt0 + d_alt_dt * t_val
+                sep = angular_separation(p_az, p_alt, b_az_t, b_alt_t)
                 return sep, p_az, p_alt, p_range
 
             best_t = 0.0
             min_sep = cur_sep
             best_p_alt = cur_alt
             best_p_range = cur_range
-            best_m_alt = moon_alt0
+            best_b_alt = body_alt0
 
             for step in range(1, 101):
                 t_cand = float(step * 3)
@@ -288,7 +329,7 @@ def get_data():
                     best_t = t_cand
                     best_p_alt = p_alt
                     best_p_range = p_range
-                    best_m_alt = moon_alt0 + d_alt_dt * t_cand
+                    best_b_alt = body_alt0 + d_alt_dt * t_cand
 
             if best_t > 0:
                 t_start = max(0.0, best_t - 3.0)
@@ -301,18 +342,18 @@ def get_data():
                         best_t = t_cand
                         best_p_alt = p_alt
                         best_p_range = p_range
-                        best_m_alt = moon_alt0 + d_alt_dt * t_cand
+                        best_b_alt = body_alt0 + d_alt_dt * t_cand
 
-            vertical_offset_deg = float(round(best_p_alt - best_m_alt, 3))
-            vertical_lunar_diams = float(round(abs(vertical_offset_deg) / max(0.01, lunar_diameter_deg), 1))
+            vertical_offset_deg = float(round(best_p_alt - best_b_alt, 3))
+            vertical_body_diams = float(round(abs(vertical_offset_deg) / max(0.01, body_diameter_deg), 1))
             vertical_offset_m = int(best_p_range * math.tan(math.radians(vertical_offset_deg)))
 
-            is_transit = True if min_sep <= moon_radius_deg else False
-            is_close = True if (min_sep > moon_radius_deg and min_sep <= (moon_radius_deg * 3.5)) else False
+            is_transit = True if min_sep <= body_radius_deg else False
+            is_close = True if (min_sep > body_radius_deg and min_sep <= (body_radius_deg * 3.5)) else False
 
             transit_duration_s = 0.0
             if is_transit and best_t > 0:
-                chord_deg = 2.0 * math.sqrt(max(0.0, (moon_radius_deg ** 2) - (min_sep ** 2)))
+                chord_deg = 2.0 * math.sqrt(max(0.0, (body_radius_deg ** 2) - (min_sep ** 2)))
                 dt_delta = 0.5
                 sep_prev, _, _, _ = evaluate_aircraft_state_at_t(max(0.0, best_t - dt_delta))
                 sep_post, _, _, _ = evaluate_aircraft_state_at_t(best_t + dt_delta)
@@ -320,15 +361,15 @@ def get_data():
                 transit_duration_s = round(chord_deg / ang_speed_deg_s, 2)
 
             if is_transit:
-                if abs(vertical_offset_deg) <= (moon_radius_deg * 0.35):
-                    position_descriptor = "Lunar Center"
+                if abs(vertical_offset_deg) <= (body_radius_deg * 0.35):
+                    position_descriptor = f"{body_name} Center"
                 elif vertical_offset_deg > 0:
                     position_descriptor = "Northern Limb (Above)"
                 else:
                     position_descriptor = "Southern Limb (Below)"
             else:
                 dir_txt = "Above" if vertical_offset_deg > 0 else "Below"
-                position_descriptor = f"{abs(vertical_offset_deg):.2f}° {dir_txt} ({vertical_lunar_diams} 🌕)"
+                position_descriptor = f"{abs(vertical_offset_deg):.2f}° {dir_txt} ({vertical_body_diams} {body_symbol})"
 
             dir_txt_clean = "Above" if vertical_offset_deg > 0 else "Below"
 
@@ -350,7 +391,7 @@ def get_data():
                 'min_sep': float(round(min_sep, 3)),
                 'vertical_offset_deg': vertical_offset_deg,
                 'vertical_offset_m': vertical_offset_m,
-                'vertical_lunar_diams': vertical_lunar_diams,
+                'vertical_body_diams': vertical_body_diams,
                 'vertical_dir_text': dir_txt_clean,
                 'tca_seconds': float(round(best_t, 1)),
                 'tca_epoch': float(now_epoch + best_t) if best_t > 0 else float(now_epoch),
@@ -364,28 +405,37 @@ def get_data():
             'source_feed': source_feed,
             'server_time': now_epoch,
             'observer_altitude_used_m': alt,
-            'moon': {
-                'azimuth': float(round(moon_az0, 2)),
-                'elevation': float(round(moon_alt0, 2)),
-                'radius_deg': float(round(moon_radius_deg, 3)),
-                'visible': moon_is_visible,
+            'target_mode': target_req,
+            'body': {
+                'type': active_target,
+                'name': body_name,
+                'symbol': body_symbol,
+                'azimuth': float(round(body_az0, 2)),
+                'elevation': float(round(body_alt0, 2)),
+                'radius_deg': float(round(body_radius_deg, 3)),
+                'visible': body_is_visible,
                 'event_type': event_type,
                 'next_event_str': next_event_str,
                 'next_event_seconds': next_event_seconds
             },
+            'sun_summary': {'az': round(sun_az0, 1), 'alt': round(sun_alt0, 1), 'visible': sun_is_visible},
+            'moon_summary': {'az': round(moon_az0, 1), 'alt': round(moon_alt0, 1), 'visible': moon_is_visible},
             'aircraft': aircraft_results
         })
 
     except Exception as e:
         print(f"[ERROR ENGINE] {e}")
-        return jsonify({'moon': {'azimuth': 0, 'elevation': -90, 'radius_deg': 0.26, 'visible': False}, 'aircraft': []})
+        return jsonify({
+            'body': {'type': 'sun', 'name': 'Sun', 'symbol': '☀️', 'azimuth': 0, 'elevation': -90, 'radius_deg': 0.26, 'visible': False},
+            'aircraft': []
+        })
 
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# WEB UI (RAW STRING TEMPLATE TO PREVENT PYTHON 3.12 WARNINGS)
+# WEB UI (COMPATIBLE CON MODO SOLAR Y LUNAR)
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -393,7 +443,7 @@ HTML_TEMPLATE = r"""
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lunar Transit Radar PRO</title>
+    <title>ASTRONOMICAL TRANSIT RADAR PRO (Solar & Lunar)</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
@@ -407,7 +457,7 @@ HTML_TEMPLATE = r"""
         .obs-dot { width: 10px; height: 10px; border-radius: 50%; background: #22d3ee; border: 2px solid #ffffff; box-shadow: 0 0 14px #06b6d4; z-index: 10; }
         @keyframes pulse-ring { 0% { transform: scale(0.5); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
         
-        .moon-marker { display: flex; align-items: center; justify-content: center; font-size: 22px; filter: drop-shadow(0 0 10px #fef08a); }
+        .astro-marker { display: flex; align-items: center; justify-content: center; font-size: 24px; filter: drop-shadow(0 0 12px #f59e0b); }
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-track { background: #0b1120; }
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
@@ -416,20 +466,27 @@ HTML_TEMPLATE = r"""
 <body class="p-2 flex flex-col h-screen overflow-hidden">
     <header class="bg-slate-900/90 backdrop-blur border border-slate-800 px-3 py-2 rounded-xl mb-1.5 flex justify-between items-center gap-2 shadow-xl">
         <div class="flex items-center gap-2.5">
-            <span class="text-2xl animate-pulse">🌔</span>
+            <span id="header-symbol" class="text-2xl animate-pulse">☀️</span>
             <div>
                 <div class="flex items-center gap-1.5">
-                    <h1 class="text-xs font-black text-amber-400 tracking-wider">LUNAR RADAR PRO</h1>
+                    <h1 class="text-xs font-black text-amber-400 tracking-wider">TRANSIT RADAR PRO</h1>
                     <span id="feed-badge" class="text-[8px] px-1 py-0.2 bg-emerald-950 text-emerald-300 border border-emerald-700 rounded font-bold">ONLINE</span>
                 </div>
-                <span id="moon-horizon-status" class="text-[10px] text-slate-400 font-bold">Computing ephemerides...</span>
+                <span id="astro-horizon-status" class="text-[10px] text-slate-400 font-bold">Computing ephemerides...</span>
             </div>
         </div>
         
+        <!-- TARGET SELECTOR (AUTO / SUN / MOON) -->
+        <div class="flex items-center bg-slate-950 p-0.5 rounded-lg border border-slate-800">
+            <button id="btn-target-auto" onclick="setTargetMode('auto')" class="text-[10px] px-2 py-1 rounded font-bold transition text-cyan-400 bg-slate-800">⚡ Auto</button>
+            <button id="btn-target-sun" onclick="setTargetMode('sun')" class="text-[10px] px-2 py-1 rounded font-bold transition text-slate-400 hover:text-amber-300">☀️ Sun</button>
+            <button id="btn-target-moon" onclick="setTargetMode('moon')" class="text-[10px] px-2 py-1 rounded font-bold transition text-slate-400 hover:text-cyan-300">🌔 Moon</button>
+        </div>
+
         <div class="flex items-center gap-2 text-xs">
             <div class="bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2">
-                <span id="moon-coords" class="text-amber-300 font-bold text-xs">Az: --° | Alt: --°</span>
-                <span id="moon-event-badge" class="text-[10px] px-1.5 py-0.5 bg-slate-900 text-slate-300 rounded border border-slate-700 font-mono">--:--</span>
+                <span id="astro-coords" class="text-amber-300 font-bold text-xs">Az: --° | Alt: --°</span>
+                <span id="astro-event-badge" class="text-[10px] px-1.5 py-0.5 bg-slate-900 text-slate-300 rounded border border-slate-700 font-mono">--:--</span>
             </div>
 
             <div class="bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2">
@@ -472,8 +529,8 @@ HTML_TEMPLATE = r"""
             </div>
 
             <div class="absolute bottom-2.5 left-2.5 z-[1000] bg-slate-950/90 backdrop-blur px-2.5 py-1.5 rounded-lg text-[11px] border border-slate-800 text-slate-300 flex items-center gap-2">
-                <span class="text-amber-400 font-bold">─ ─ ─</span>
-                <span id="footer-moon-info">Optical Line of Sight to the Moon</span>
+                <span id="footer-vector-beam" class="text-amber-400 font-bold">─ ─ ─</span>
+                <span id="footer-astro-info">Optical Line of Sight</span>
             </div>
         </div>
 
@@ -530,30 +587,26 @@ HTML_TEMPLATE = r"""
         <div class="bg-slate-900 border border-slate-700 rounded-2xl p-5 max-w-2xl w-full max-h-[85vh] overflow-y-auto shadow-2xl flex flex-col gap-3.5">
             <div class="flex justify-between items-center border-b border-slate-800 pb-2">
                 <div>
-                    <h3 class="font-black text-base text-amber-400">ℹ️ About Lunar Transit Radar PRO</h3>
-                    <p class="text-[10px] text-slate-400">NASA JPL Astrometry, Vertical Offset & 4D Kinematics</p>
+                    <h3 class="font-black text-base text-amber-400">ℹ️ About Astronomical Transit Radar PRO</h3>
+                    <p class="text-[10px] text-slate-400">Solar & Lunar Transits with NASA JPL Ephemerides</p>
                 </div>
                 <button onclick="toggleAboutModal()" class="text-slate-400 hover:text-white font-bold text-lg">✕</button>
             </div>
 
             <div class="text-xs text-slate-300 flex flex-col gap-3 leading-relaxed">
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
-                    <h4 class="font-bold text-cyan-400 mb-1">1. Exact Vertical Offset relative to the Moon</h4>
-                    <p>The system propagates the 3D flight trajectory along the <b>WGS84</b> ellipsoid and computes the exact vertical angular offset ($\Delta\text{Alt} = \text{Alt}_\text{aircraft} - \text{Alt}_\text{moon}$) at the moment of closest approach. It indicates if the aircraft passes above (+) or below (-) in degrees, equivalent lunar diameters, and physical meters.</p>
+                <div class="bg-amber-950/40 p-3 rounded-xl border border-amber-700/60 text-amber-200">
+                    <h4 class="font-bold text-amber-400 mb-1">⚠️ Solar Transit Safety Warning</h4>
+                    <p>Never observe or photograph solar transits through an optical instrument (telescope, binoculars, telephoto lens) without a certified <b>full-aperture solar filter (ND5.0 / Baader Solar Safety Film)</b>. Irreversible eye and sensor damage will occur instantly without adequate protection.</p>
                 </div>
 
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
-                    <h4 class="font-bold text-cyan-400 mb-1">2. Real-Time TCA Countdown for All Flights</h4>
-                    <p>All tracked aircraft have a live countdown timer referenced to their instant of closest approach to the Moon's optical axis.</p>
+                    <h4 class="font-bold text-cyan-400 mb-1">1. Dual Astrometric Engine (Sun & Moon)</h4>
+                    <p>Real-time calculation of topocentric coordinates with topocentric parallax using the <b>NASA JPL DE421</b> planetary ephemeris. Supports automated daytime (☀️) and nighttime (🌔) switching with 4D kinematic extrapolation.</p>
                 </div>
 
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
-                    <h4 class="font-bold text-cyan-400 mb-1">3. Data Sources & Cartography</h4>
-                    <ul class="list-disc pl-4 space-y-1 text-slate-400">
-                        <li><b>Astrometry:</b> Official <b>NASA JPL DE421</b> ephemeris and <b>Skyfield</b> with topocentric parallax.</li>
-                        <li><b>ADS-B:</b> <code class="text-cyan-300">airplanes.live</code> and <code class="text-cyan-300">adsb.lol</code>.</li>
-                        <li><b>Cartography:</b> Official authenticated <b>CARTO Dark Matter HD</b>.</li>
-                    </ul>
+                    <h4 class="font-bold text-cyan-400 mb-1">2. Precision Vertical Offsets</h4>
+                    <p>Calculates the angular difference ($\Delta\text{Alt} = \text{Alt}_\text{aircraft} - \text{Alt}_\text{astro}$) at the exact instant of closest approach (TCA), denoting passes relative to the Northern/Southern solar or lunar limbs.</p>
                 </div>
             </div>
 
@@ -570,6 +623,7 @@ HTML_TEMPLATE = r"""
         let savedLon = localStorage.getItem('obs_lon');
         let savedBuilding = localStorage.getItem('obs_building_m');
         let savedCalib = localStorage.getItem('obs_calib');
+        let currentTargetMode = localStorage.getItem('obs_target_mode') || 'auto';
 
         let observerLat = savedLat ? parseFloat(savedLat) : 41.6079;
         let observerLon = savedLon ? parseFloat(savedLon) : 2.2876;
@@ -579,15 +633,13 @@ HTML_TEMPLATE = r"""
 
         let serverClockDelta = 0.0;
         let isLocationLocked = true;
-        let currentMoonAz = 0;
-        let currentMoonAlt = 0;
-        let moonVisible = false;
+        let activeBody = { type: 'sun', name: 'Sun', symbol: '☀️', azimuth: 0, elevation: 0, visible: false };
         let audioEnabled = false;
         let audioContext = null;
         let lastBeepedFlight = 0;
         let lastAnimTime = 0;
 
-        let map, obsMarker, moonLine, moonIconMarker;
+        let map, obsMarker, astroLine, astroIconMarker;
         let currentBaseTileLayer, isSatelliteMode = false;
         
         const planesState = {};
@@ -635,7 +687,7 @@ HTML_TEMPLATE = r"""
         obsMarker.on('drag', function(e) {
             const pos = e.target.getLatLng();
             observerLat = pos.lat; observerLon = pos.lng;
-            renderMoonVector();
+            renderAstroVector();
         });
 
         obsMarker.on('dragend', function (e) {
@@ -649,6 +701,31 @@ HTML_TEMPLATE = r"""
                 saveAndSetObserverPos(e.latlng.lat, e.latlng.lng);
             }
         });
+
+        function setTargetMode(mode) {
+            currentTargetMode = mode;
+            localStorage.setItem('obs_target_mode', mode);
+            updateTargetButtons();
+            fetchData();
+        }
+
+        function updateTargetButtons() {
+            const bAuto = document.getElementById('btn-target-auto');
+            const bSun = document.getElementById('btn-target-sun');
+            const bMoon = document.getElementById('btn-target-moon');
+            
+            [bAuto, bSun, bMoon].forEach(b => {
+                b.className = "text-[10px] px-2 py-1 rounded font-bold transition text-slate-400 hover:text-white";
+            });
+
+            if (currentTargetMode === 'auto') {
+                bAuto.className = "text-[10px] px-2 py-1 rounded font-bold transition text-cyan-300 bg-slate-800 border border-slate-700";
+            } else if (currentTargetMode === 'sun') {
+                bSun.className = "text-[10px] px-2 py-1 rounded font-bold transition text-amber-300 bg-amber-950 border border-amber-700";
+            } else if (currentTargetMode === 'moon') {
+                bMoon.className = "text-[10px] px-2 py-1 rounded font-bold transition text-cyan-300 bg-cyan-950 border border-cyan-700";
+            }
+        }
 
         function toggleLocationLock() {
             isLocationLocked = !isLocationLocked;
@@ -708,7 +785,7 @@ HTML_TEMPLATE = r"""
             document.getElementById('obs-coords').innerText = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
             
             fetchTerrainElevation(lat, lon);
-            renderMoonVector();
+            renderAstroVector();
             fetchData();
         }
 
@@ -765,34 +842,39 @@ HTML_TEMPLATE = r"""
             return '#a855f7';
         }
 
-        function renderMoonVector() {
-            if (!moonVisible) {
-                if (moonLine) map.removeLayer(moonLine);
-                if (moonIconMarker) map.removeLayer(moonIconMarker);
+        function renderAstroVector() {
+            if (!activeBody.visible) {
+                if (astroLine) map.removeLayer(astroLine);
+                if (astroIconMarker) map.removeLayer(astroIconMarker);
                 return;
             }
 
             const distKm = 55;
-            const radAz = (currentMoonAz * Math.PI) / 180;
+            const radAz = (activeBody.azimuth * Math.PI) / 180;
             const dLat = (distKm * Math.cos(radAz)) / 111.0;
             const dLon = (distKm * Math.sin(radAz)) / (111.0 * Math.cos(observerLat * Math.PI / 180));
             const endPoint = [observerLat + dLat, observerLon + dLon];
 
-            if (moonLine) {
-                moonLine.setLatLngs([[observerLat, observerLon], endPoint]);
+            const lineColor = activeBody.type === 'sun' ? '#f59e0b' : '#38bdf8';
+
+            if (astroLine) {
+                astroLine.setLatLngs([[observerLat, observerLon], endPoint]);
+                astroLine.setStyle({ color: lineColor });
             } else {
-                moonLine = L.polyline([[observerLat, observerLon], endPoint], {
-                    color: '#fbbf24', weight: 2, dashArray: '5, 8', opacity: 0.95
+                astroLine = L.polyline([[observerLat, observerLon], endPoint], {
+                    color: lineColor, weight: 2, dashArray: '5, 8', opacity: 0.95
                 }).addTo(map);
             }
 
-            if (moonIconMarker) {
-                moonIconMarker.setLatLng(endPoint);
+            if (astroIconMarker) {
+                astroIconMarker.setLatLng(endPoint);
+                const el = astroIconMarker.getElement();
+                if (el) el.innerHTML = `<div>${activeBody.symbol}</div>`;
             } else {
-                const moonDiv = L.divIcon({
-                    className: 'moon-marker', html: '<div>🌕</div>', iconSize: [24, 24], iconAnchor: [12, 12]
+                const astroDiv = L.divIcon({
+                    className: 'astro-marker', html: `<div>${activeBody.symbol}</div>`, iconSize: [26, 26], iconAnchor: [13, 13]
                 });
-                moonIconMarker = L.marker(endPoint, { icon: moonDiv }).addTo(map);
+                astroIconMarker = L.marker(endPoint, { icon: astroDiv }).addTo(map);
             }
         }
 
@@ -802,43 +884,41 @@ HTML_TEMPLATE = r"""
         async function fetchData() {
             try {
                 const totalObserverAlt = terrainElevationM + buildingOffsetM;
-                const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}`);
+                const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}&target=${currentTargetMode}`);
                 const data = await res.json();
                 
                 if (data.server_time) {
                     serverClockDelta = (Date.now() / 1000.0) - data.server_time;
                 }
 
-                const m = data.moon;
-                currentMoonAz = m.azimuth;
-                currentMoonAlt = m.elevation;
-                moonVisible = m.visible;
+                activeBody = data.body;
 
                 if (data.source_feed) {
                     document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
                 }
 
-                const horizonStatusEl = document.getElementById('moon-horizon-status');
-                const badgeEl = document.getElementById('moon-event-badge');
-                const footerInfoEl = document.getElementById('footer-moon-info');
+                document.getElementById('header-symbol').innerText = activeBody.symbol;
+                const horizonStatusEl = document.getElementById('astro-horizon-status');
+                const badgeEl = document.getElementById('astro-event-badge');
+                const footerInfoEl = document.getElementById('footer-astro-info');
 
-                if (moonVisible) {
-                    document.getElementById('moon-coords').innerText = `Az: ${m.azimuth}° | Alt: +${m.elevation}°`;
-                    horizonStatusEl.innerText = `🌕 Moon Visible (Sets at ${m.next_event_str})`;
-                    horizonStatusEl.className = "text-[10px] text-amber-300 font-bold";
-                    badgeEl.innerText = `Sets: ${m.next_event_str}`;
-                    badgeEl.className = "text-[10px] px-1.5 py-0.5 bg-amber-950 text-amber-300 rounded border border-amber-800 font-mono";
-                    footerInfoEl.innerText = "Optical Line of Sight to the Moon (Visible)";
+                if (activeBody.visible) {
+                    document.getElementById('astro-coords').innerText = `${activeBody.name}: Az ${activeBody.azimuth}° | Alt +${activeBody.elevation}°`;
+                    horizonStatusEl.innerText = `${activeBody.symbol} ${activeBody.name} Visible (${activeBody.event_type === 'SET' ? 'Sets' : 'Rises'} at ${activeBody.next_event_str})`;
+                    horizonStatusEl.className = activeBody.type === 'sun' ? "text-[10px] text-amber-300 font-bold" : "text-[10px] text-cyan-300 font-bold";
+                    badgeEl.innerText = `${activeBody.event_type}: ${activeBody.next_event_str}`;
+                    badgeEl.className = activeBody.type === 'sun' ? "text-[10px] px-1.5 py-0.5 bg-amber-950 text-amber-300 rounded border border-amber-800 font-mono" : "text-[10px] px-1.5 py-0.5 bg-cyan-950 text-cyan-300 rounded border border-cyan-800 font-mono";
+                    footerInfoEl.innerText = `Line of sight to the ${activeBody.name} (Visible)`;
                 } else {
-                    document.getElementById('moon-coords').innerText = `Hidden (${m.elevation}°)`;
-                    horizonStatusEl.innerText = `🌑 Moon Below Horizon (Rises at ${m.next_event_str})`;
+                    document.getElementById('astro-coords').innerText = `${activeBody.name} Hidden (${activeBody.elevation}°)`;
+                    horizonStatusEl.innerText = `🌑 ${activeBody.name} Below Horizon (${activeBody.event_type === 'RISE' ? 'Rises' : 'Sets'} at ${activeBody.next_event_str})`;
                     horizonStatusEl.className = "text-[10px] text-slate-400 font-bold";
-                    badgeEl.innerText = `Rises: ${m.next_event_str}`;
+                    badgeEl.innerText = `${activeBody.event_type}: ${activeBody.next_event_str}`;
                     badgeEl.className = "text-[10px] px-1.5 py-0.5 bg-slate-900 text-slate-400 rounded border border-slate-700 font-mono";
-                    footerInfoEl.innerText = `Moon below horizon (Rises at ${m.next_event_str})`;
+                    footerInfoEl.innerText = `${activeBody.name} below horizon (Rises at ${activeBody.next_event_str})`;
                 }
 
-                renderMoonVector();
+                renderAstroVector();
 
                 activeAircraftData = data.aircraft || [];
                 document.getElementById('plane-count').innerText = activeAircraftData.length;
@@ -850,7 +930,7 @@ HTML_TEMPLATE = r"""
                     currentCallsigns.add(cs);
 
                     const color = getAltitudeColor(plane.alt_ft);
-                    const glow = (plane.is_transit && moonVisible) ? 'filter: drop-shadow(0 0 12px #ef4444);' : (plane.is_close && moonVisible ? 'filter: drop-shadow(0 0 8px #f59e0b);' : '');
+                    const glow = (plane.is_transit && activeBody.visible) ? 'filter: drop-shadow(0 0 12px #ef4444);' : (plane.is_close && activeBody.visible ? 'filter: drop-shadow(0 0 8px #f59e0b);' : '');
 
                     const planeHtml = `
                         <div style="transform: rotate(${plane.track}deg); width: 24px; height: 24px; display:flex; align-items:center; justify-content:center; ${glow}">
@@ -871,7 +951,7 @@ HTML_TEMPLATE = r"""
                                 <b>REG:</b> ${plane.reg || 'N/A'}<br>
                                 <b>ALTITUDE:</b> ${plane.alt_ft} ft (${plane.vr_fpm > 300 ? '↗' : (plane.vr_fpm < -300 ? '↘' : '→')} ${plane.vr_fpm} ft/min)<br>
                                 <b>SPEED:</b> ${plane.speed_kt} kt | <b>DIST:</b> ${plane.distance_km} km<br>
-                                ${moonVisible ? `<b>VERT OFFSET:</b> ${plane.vertical_offset_deg > 0 ? '+' : ''}${plane.vertical_offset_deg}° (${plane.vertical_dir_text})<br><b>SEPARATION:</b> ${plane.min_sep}°<br><b>TCA:</b> ${plane.tca_seconds}s` : `<b>HEADING:</b> ${plane.track}°`}
+                                ${activeBody.visible ? `<b>VERT OFFSET:</b> ${plane.vertical_offset_deg > 0 ? '+' : ''}${plane.vertical_offset_deg}° (${plane.vertical_dir_text})<br><b>SEPARATION:</b> ${plane.min_sep}°<br><b>TCA:</b> ${plane.tca_seconds}s` : `<b>HEADING:</b> ${plane.track}°`}
                             </div>
                         `);
 
@@ -948,8 +1028,8 @@ HTML_TEMPLATE = r"""
             let html = '';
             activeAircraftData.forEach(plane => {
                 const remaining = Math.max(0.0, (plane.tca_epoch - now) + timingCalibrationSec);
-                const isTransit = plane.is_transit && moonVisible;
-                const isClose = plane.is_close && moonVisible;
+                const isTransit = plane.is_transit && activeBody.visible;
+                const isClose = plane.is_close && activeBody.visible;
 
                 const mins = Math.floor(remaining / 60);
                 const secs = (remaining % 60).toFixed(1).padStart(4, '0');
@@ -959,8 +1039,8 @@ HTML_TEMPLATE = r"""
                 let tagHtml = `<span class="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[8px] font-bold">EN ROUTE</span>`;
                 let statusDetails = '';
 
-                if (!moonVisible) {
-                    tagHtml = `<span class="bg-slate-900 text-slate-500 px-1.5 py-0.5 rounded text-[8px] font-bold">MOON DOWN</span>`;
+                if (!activeBody.visible) {
+                    tagHtml = `<span class="bg-slate-900 text-slate-500 px-1.5 py-0.5 rounded text-[8px] font-bold">${activeBody.name.toUpperCase()} DOWN</span>`;
                     statusDetails = `
                         <span>Heading: <b>${plane.track}°</b></span>
                         <span>Speed: <b>${plane.speed_kt} kt</b></span>
@@ -987,7 +1067,7 @@ HTML_TEMPLATE = r"""
                     const sign = plane.vertical_offset_deg > 0 ? '+' : '';
                     const vertColor = isClose ? 'text-amber-300' : 'text-slate-200';
                     statusDetails = `
-                        <span class="col-span-2">Vert Offset: <b class="${vertColor}">${sign}${plane.vertical_offset_deg}° ${plane.vertical_dir_text} (${plane.vertical_lunar_diams} 🌕 / ${sign}${plane.vertical_offset_m}m)</b></span>
+                        <span class="col-span-2">Vert Offset: <b class="${vertColor}">${sign}${plane.vertical_offset_deg}° ${plane.vertical_dir_text} (${plane.vertical_body_diams} ${activeBody.symbol} / ${sign}${plane.vertical_offset_m}m)</b></span>
                     `;
                 }
 
@@ -1028,6 +1108,7 @@ HTML_TEMPLATE = r"""
         document.getElementById('building-offset').value = buildingOffsetM.toString();
         document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
 
+        updateTargetButtons();
         fetchData();
         fetchTerrainElevation(observerLat, observerLon);
         setInterval(fetchData, 2500);
@@ -1041,6 +1122,7 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO - SERVER RUNNING ON PORT {port}")
+    print(f" [OK] ASTRONOMICAL TRANSIT RADAR PRO (SOLAR & LUNAR)")
+    print(f" [OK] Running on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
