@@ -114,7 +114,7 @@ def get_live_aircraft(cur_lat, cur_lon):
     if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
         return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/24.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/25.0'}
     
     # 1. airplanes.live
     try:
@@ -280,6 +280,7 @@ def get_data():
                     b_alt_t = b_alt0 + d_alt * t_val
                     return angular_separation(p_az, p_alt, b_az_t, b_alt_t), p_az, p_alt, p_range
 
+                # Fase 1: Barrido global (Paso 2.0s de 0 a 300s)
                 best_t = 0.0
                 min_sep = cur_sep
                 best_p_alt, best_p_range, best_b_alt = cur_alt, cur_range, b_alt0
@@ -686,6 +687,9 @@ HTML_TEMPLATE = r"""
         let voiceEnabled = false;
         let audioContext = null;
         let lastBeepedFlight = 0;
+        
+        // Registro de avisos y descubrimientos tempranos
+        let detectedTransits = new Set();
         let spokenCountdowns = new Set();
         let lastAnimTime = 0;
 
@@ -832,13 +836,34 @@ HTML_TEMPLATE = r"""
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 btn.innerText = "🔔";
                 btn.className = "bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition";
-                playTone(880, 0.1);
+                playChime();
             } else {
                 btn.innerText = "🔇";
                 btn.className = "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition";
             }
         }
 
+        // 1. Repic melòdic suau per alertes de descobriment i fites (C5-E5-G5)
+        function playChime() {
+            if (!audioEnabled || !audioContext) return;
+            try {
+                const now = audioContext.currentTime;
+                [523.25, 659.25, 783.99].forEach((freq, i) => {
+                    const osc = audioContext.createOscillator();
+                    const gain = audioContext.createGain();
+                    osc.frequency.value = freq;
+                    osc.type = 'sine';
+                    gain.gain.setValueAtTime(0.12, now + i * 0.09);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.09 + 0.35);
+                    osc.connect(gain);
+                    gain.connect(audioContext.destination);
+                    osc.start(now + i * 0.09);
+                    osc.stop(now + i * 0.09 + 0.35);
+                });
+            } catch (e) {}
+        }
+
+        // 2. Beep curt per al compte enrere final (5, 4, 3, 2, 1s)
         function playTone(freq, duration) {
             if (!audioEnabled || !audioContext) return;
             try {
@@ -846,12 +871,32 @@ HTML_TEMPLATE = r"""
                 const gain = audioContext.createGain();
                 osc.frequency.value = freq;
                 osc.type = 'sine';
-                gain.gain.setValueAtTime(0.15, audioContext.currentTime);
+                gain.gain.setValueAtTime(0.16, audioContext.currentTime);
                 gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + duration);
                 osc.connect(gain);
                 gain.connect(audioContext.destination);
                 osc.start();
                 osc.stop(audioContext.currentTime + duration);
+            } catch (e) {}
+        }
+
+        // 3. Acord harmònic de pas al moment exacte del trànsit (T=0)
+        function playTransitChord() {
+            if (!audioEnabled || !audioContext) return;
+            try {
+                const now = audioContext.currentTime;
+                [880, 1108.73, 1318.51, 1760].forEach(freq => {
+                    const osc = audioContext.createOscillator();
+                    const gain = audioContext.createGain();
+                    osc.frequency.value = freq;
+                    osc.type = 'triangle';
+                    gain.gain.setValueAtTime(0.14, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.65);
+                    osc.connect(gain);
+                    gain.connect(audioContext.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.65);
+                });
             } catch (e) {}
         }
 
@@ -1095,7 +1140,7 @@ HTML_TEMPLATE = r"""
             requestAnimationFrame(animateFrame);
         }
 
-        // TELEMETRY HUD & NOTIFICACIONES ACÚSTICAS
+        // TELEMETRY HUD & NOTIFICACIONS ACÚSTIQUES D'ALERTA PRIMERENCA
         function updateHUDCountdowns() {
             const container = document.getElementById('alerts-container');
             if (!activeAircraftData || activeAircraftData.length === 0) {
@@ -1121,6 +1166,7 @@ HTML_TEMPLATE = r"""
                 const isTransit = target.is_transit && isTargetVisible;
                 const isClose = target.is_close && isTargetVisible;
                 const sym = target.target === 'sun' ? '☀️' : '🌕';
+                const bodyLabel = (target.target === 'sun' ? 'Solar' : 'Lunar');
 
                 const mins = Math.floor(remaining / 60);
                 const secs = (remaining % 60).toFixed(1).padStart(4, '0');
@@ -1133,18 +1179,55 @@ HTML_TEMPLATE = r"""
                     cardBorder = 'border-red-500 bg-red-950/70 shadow-lg shadow-red-950/60';
                     tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[9px] font-black animate-pulse">🎯 ${sym} TRANSIT (${target.transit_duration_s}s)!</span>`;
                     
-                    if (remaining <= 15.0 && remaining > 0) {
-                        const wholeSec = Math.floor(remaining);
-                        if ([15, 10, 5, 3, 2, 1].includes(wholeSec) && !spokenCountdowns.has(`${plane.callsign}-${wholeSec}`)) {
-                            spokenCountdowns.add(`${plane.callsign}-${wholeSec}`);
-                            if (wholeSec === 15) speak(`${target.target === 'sun' ? 'Solar' : 'Lunar'} transit in 15 seconds`);
-                            if (wholeSec <= 5) playTone(1200 + (5 - wholeSec) * 100, 0.15);
+                    const flightKey = `${plane.callsign}-${target.target}`;
+
+                    // 1. ALERTA DE DESCOBRIMENT TEMPRÀ (Immediat en detectar-se a qualsevol distància/temps)
+                    if (!detectedTransits.has(flightKey)) {
+                        detectedTransits.add(flightKey);
+                        playChime();
+                        const mRemain = Math.floor(remaining / 60);
+                        const sRemain = Math.floor(remaining % 60);
+                        let timeAnnouncement = mRemain > 0 ? `${mRemain} minute${mRemain > 1 ? 's' : ''} and ${sRemain} seconds` : `${sRemain} seconds`;
+                        speak(`Attention. New ${bodyLabel} transit detected for flight ${plane.callsign} in ${timeAnnouncement}`);
+                    }
+
+                    // 2. FITES D'AVÍS AMB TEMPS SUFICIENT DE PREPARACIÓ
+                    const wholeSec = Math.floor(remaining);
+                    const alertKey = `${flightKey}-${wholeSec}`;
+
+                    if (!spokenCountdowns.has(alertKey) && remaining > 0) {
+                        if (wholeSec === 180) { // 3 minuts
+                            spokenCountdowns.add(alertKey);
+                            playChime();
+                            speak(`${bodyLabel} transit in 3 minutes`);
+                        } else if (wholeSec === 120) { // 2 minuts
+                            spokenCountdowns.add(alertKey);
+                            playChime();
+                            speak(`${bodyLabel} transit in 2 minutes, prepare camera`);
+                        } else if (wholeSec === 60) { // 1 minut
+                            spokenCountdowns.add(alertKey);
+                            playChime();
+                            speak(`Warning: ${bodyLabel} transit in 1 minute`);
+                        } else if (wholeSec === 30) { // 30 segons
+                            spokenCountdowns.add(alertKey);
+                            playChime();
+                            speak(`${bodyLabel} transit in 30 seconds`);
+                        } else if (wholeSec === 15) { // 15 segons
+                            spokenCountdowns.add(alertKey);
+                            speak(`${bodyLabel} transit in 15 seconds`);
+                        } else if (wholeSec === 10) { // 10 segons
+                            spokenCountdowns.add(alertKey);
+                            speak("10 seconds");
+                        } else if ([5, 4, 3, 2, 1].includes(wholeSec)) { // Cadència final de disparador
+                            spokenCountdowns.add(alertKey);
+                            playTone(1100 + (5 - wholeSec) * 120, 0.12);
                         }
                     }
 
-                    if (remaining <= 0.2 && lastBeepedFlight !== plane.callsign) {
-                        playTone(1760, 0.5);
-                        lastBeepedFlight = plane.callsign;
+                    // 3. MOMENT EXACTE DEL CREUAMENT (T = 0s)
+                    if (remaining <= 0.2 && lastBeepedFlight !== flightKey) {
+                        playTransitChord();
+                        lastBeepedFlight = flightKey;
                     }
                 } else if (isClose) {
                     cardBorder = 'border-amber-500 bg-amber-950/60';
@@ -1203,7 +1286,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
     print(f" [OK] LUNAR TRANSIT RADAR PRO - BY MARC GARRIDO")
-    print(f" [OK] Maximum Precision Engine & Google SEO Meta Active")
+    print(f" [OK] Early Warning Soundscape & Multi-Minute Voice Alerts Active")
     print(f" [OK] Verification: /google92a4c5b46b2ec0bf.html")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
