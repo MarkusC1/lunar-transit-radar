@@ -110,7 +110,7 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. GESTIÓN DE CACHÉ ADS-B PROBADA Y ESTABLE EN RENDER
+# 2. GESTIÓN DE CACHÉ ADS-B ESTABLE EN RENDER
 # =========================================================================
 CACHE = {
     'lat': 0.0,
@@ -548,7 +548,6 @@ HTML_TEMPLATE = r"""
             border: none !important;
         }
 
-        /* Marcador táctico del observador con haz de barrido GPU */
         .obs-target { 
             position: relative;
             display: flex; 
@@ -588,7 +587,6 @@ HTML_TEMPLATE = r"""
         @keyframes pulse-ring { 0% { transform: scale(0.6); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
         @keyframes radar-sweep { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
-        /* Retículo de intercepción en mapa */
         .tca-target { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; }
         .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; will-change: transform; }
         .tca-crosshair-h { position: absolute; width: 28px; height: 1.5px; background: rgba(239, 68, 68, 0.8); }
@@ -596,7 +594,6 @@ HTML_TEMPLATE = r"""
         .tca-core { width: 6px; height: 6px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 12px #ef4444; z-index: 10; }
         @keyframes tca-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
-        /* Paneles tácticos con efecto HUD de aviónica militar */
         .avionics-panel { 
             background: linear-gradient(180deg, rgba(15, 23, 42, 0.95) 0%, rgba(3, 7, 18, 0.98) 100%);
             backdrop-filter: blur(14px);
@@ -604,7 +601,6 @@ HTML_TEMPLATE = r"""
             box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7);
         }
 
-        /* Tarjeta POD con muescas angulares en las esquinas */
         .hud-card { 
             position: relative;
             background: rgba(11, 19, 38, 0.85);
@@ -669,7 +665,7 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
         
-        <!-- TARJETAS DE CUERPOS CELESTES RECUPERADAS CON GLOW DINÁMICO -->
+        <!-- TARJETAS DE CUERPOS CELESTES CON GLOW DINÁMICO -->
         <div class="flex items-center gap-1.5 text-xs">
             <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer hover:border-cyan-400 transition glow-cyan ring-1 ring-cyan-400/50" onclick="setFilterMode('moon')">
                 <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
@@ -724,10 +720,10 @@ HTML_TEMPLATE = r"""
             </button>
         </div>
 
-        <!-- HERRAMIENTAS RÁPIDAS -->
+        <!-- HERRAMIENTAS Y AUDIO ACTIVADOS POR DEFECTO -->
         <div class="flex items-center gap-1">
-            <button id="voice-btn" onclick="toggleVoice()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">🗣️</button>
-            <button id="audio-btn" onclick="toggleAudio()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">🔇</button>
+            <button id="voice-btn" onclick="toggleVoice()" class="bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition shadow-[0_0_10px_rgba(168,85,247,0.4)]" title="Voz activada">🗣️</button>
+            <button id="audio-btn" onclick="toggleAudio()" class="bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition shadow-[0_0_10px_rgba(16,185,129,0.4)]" title="Sonido activado">🔔</button>
             <button onclick="toggleSettingsModal()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">⚙️</button>
             <button onclick="locateUser()" class="bg-cyan-600 hover:bg-cyan-500 text-white text-xs px-2.5 py-1.5 rounded-lg font-bold transition shadow-lg shadow-cyan-600/30">📍</button>
         </div>
@@ -791,32 +787,59 @@ HTML_TEMPLATE = r"""
             </div>
             
             <div id="alerts-container" class="flex flex-col gap-2 overflow-y-auto">
-                <div class="text-xs text-slate-500 text-center py-8">Scanning airspace for transit intercept...</div>
+                <div class="text-xs text-slate-500 text-center py-8 font-mono">Scanning airspace for transit intercept...</div>
             </div>
         </div>
     </div>
 
-    <!-- MODAL AJUSTES Y CALIBRACIÓN -->
+    <!-- MODAL AJUSTES Y CALIBRACIÓN AVANZADA DE ALTURA -->
     <div id="settings-modal" class="fixed inset-0 z-[2000] bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4">
-        <div class="bg-slate-900 border border-slate-700 rounded-2xl p-4 max-w-sm w-full shadow-2xl flex flex-col gap-3">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl p-4 max-w-sm w-full shadow-2xl flex flex-col gap-3 font-mono">
             <div class="flex justify-between items-center border-b border-slate-800 pb-2">
-                <h3 class="font-bold text-sm text-cyan-400">⚙️ Settings & Calibration</h3>
+                <h3 class="font-bold text-sm text-cyan-400">⚙️ Configuración & Calibración</h3>
                 <button onclick="toggleSettingsModal()" class="text-slate-400 hover:text-white font-bold">✕</button>
             </div>
             
-            <div class="flex flex-col gap-1">
-                <label class="text-xs text-slate-300 font-bold">🏢 Observer / Rooftop Elevation Offset</label>
-                <div class="flex items-center gap-2">
-                    <input id="building-offset" type="number" value="0" min="0" max="500" onchange="updateBuildingOffset(this.value)" class="w-full bg-slate-950 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold tabular-nums">
-                    <span class="text-slate-400 text-xs font-bold">m</span>
+            <!-- GESTIÓN ORÓGRAFICA / ELEVACIÓN DEL OBSERVADOR -->
+            <div class="flex flex-col gap-2 bg-slate-950 p-2.5 rounded-xl border border-slate-800">
+                <div class="flex justify-between items-center">
+                    <span class="text-[10px] text-slate-300 font-bold uppercase tracking-wider">⛰️ Cota del Terreno (MSL)</span>
+                    <button onclick="detectTerrainAuto()" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 rounded border border-cyan-800">
+                        Auto-Detect
+                    </button>
                 </div>
+                <div class="flex items-center gap-2">
+                    <input id="terrain-elevation-input" type="number" step="1" oninput="calculateModalTotalAlt()" class="w-full bg-slate-900 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold tabular-nums">
+                    <span class="text-slate-400 text-xs">m</span>
+                </div>
+
+                <div class="flex justify-between items-center mt-1">
+                    <span class="text-[10px] text-slate-300 font-bold uppercase tracking-wider">🏢 Azotea / Trípode (Offset)</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <input id="building-offset" type="number" step="0.5" min="0" max="500" oninput="calculateModalTotalAlt()" class="w-full bg-slate-900 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold tabular-nums">
+                    <span class="text-slate-400 text-xs">m</span>
+                </div>
+
+                <div class="flex justify-between items-center pt-2 border-t border-slate-800/80 text-xs">
+                    <span class="text-slate-400 font-bold">Cota Total Efectiva:</span>
+                    <span id="total-alt-display" class="text-emerald-400 font-black tabular-nums">145m</span>
+                </div>
+            </div>
+
+            <!-- PRUEBA DE AUDIO -->
+            <div class="flex justify-between items-center bg-slate-950 p-2 rounded-xl border border-slate-800">
+                <span class="text-[10px] text-slate-300 font-bold">🔊 Sistema Acústico</span>
+                <button onclick="testAudioSystem()" class="px-2 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 border border-emerald-800 rounded text-[10px] font-bold">
+                    🔔 Test Audio
+                </button>
             </div>
 
             <div class="flex justify-between items-center pt-2 border-t border-slate-800">
                 <button onclick="toggleMapLayer()" id="layer-btn" class="bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 font-bold transition">
-                    🗺️ Toggle Sat Map
+                    🗺️ Toggle Sat
                 </button>
-                <button onclick="toggleSettingsModal()" class="bg-cyan-600 hover:bg-cyan-500 text-xs text-white px-4 py-1.5 rounded-lg font-bold transition">
+                <button onclick="saveAltitudeSettings()" class="bg-cyan-600 hover:bg-cyan-500 text-xs text-white px-4 py-1.5 rounded-lg font-bold transition">
                     Guardar
                 </button>
             </div>
@@ -828,7 +851,7 @@ HTML_TEMPLATE = r"""
 
         let observerLat = parseFloat(localStorage.getItem('obs_lat') || 41.6079);
         let observerLon = parseFloat(localStorage.getItem('obs_lon') || 2.2876);
-        let terrainElevationM = 145.0;
+        let terrainElevationM = parseFloat(localStorage.getItem('obs_terrain_m') || 145.0);
         let buildingOffsetM = parseFloat(localStorage.getItem('obs_building_m') || 0.0);
         let userLeadSec = parseFloat(localStorage.getItem('user_lead_sec') || 6.0);
 
@@ -837,8 +860,10 @@ HTML_TEMPLATE = r"""
         let terminalPaused = false;
         let isLocationLocked = true;
         let serverClockDelta = 0.0;
-        let audioEnabled = false;
-        let voiceEnabled = false;
+        
+        // ALERTAS DE SONIDO Y VOZ ACTIVADAS POR DEFECTO
+        let audioEnabled = true;
+        let voiceEnabled = true;
         let audioContext = null;
         let lastBeepedFlight = '';
         
@@ -858,6 +883,19 @@ HTML_TEMPLATE = r"""
         
         const planesState = {};
         let activeAircraftData = [];
+
+        // Inicialización y desbloqueo transparente de AudioContext en el primer toque de pantalla
+        function initAndUnlockAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+        }
+        ['click', 'touchstart', 'pointerdown', 'keydown'].forEach(ev => {
+            window.addEventListener(ev, initAndUnlockAudio, { passive: true });
+        });
 
         map = L.map('map', { preferCanvas: true, zoomControl: false }).setView([observerLat, observerLon], 10);
         L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -965,6 +1003,39 @@ HTML_TEMPLATE = r"""
         function toggleSettingsModal() {
             const m = document.getElementById('settings-modal');
             m.classList.toggle('hidden'); m.classList.toggle('flex');
+            if (!m.classList.contains('hidden')) {
+                updateAltitudeDisplay();
+            }
+        }
+
+        function calculateModalTotalAlt() {
+            const tVal = parseFloat(document.getElementById('terrain-elevation-input').value) || 0;
+            const bVal = parseFloat(document.getElementById('building-offset').value) || 0;
+            document.getElementById('total-alt-display').innerText = `${Math.round(tVal + bVal)}m`;
+        }
+
+        function saveAltitudeSettings() {
+            const tVal = parseFloat(document.getElementById('terrain-elevation-input').value);
+            const bVal = parseFloat(document.getElementById('building-offset').value);
+            if (!isNaN(tVal)) terrainElevationM = Math.max(-400, Math.min(9000, tVal));
+            if (!isNaN(bVal)) buildingOffsetM = Math.max(0, Math.min(1000, bVal));
+            
+            localStorage.setItem('obs_terrain_m', terrainElevationM.toString());
+            localStorage.setItem('obs_building_m', buildingOffsetM.toString());
+            
+            updateAltitudeDisplay();
+            fetchData();
+            toggleSettingsModal();
+        }
+
+        function detectTerrainAuto() {
+            fetchTerrainElevation(observerLat, observerLon, true);
+        }
+
+        function testAudioSystem() {
+            initAndUnlockAudio();
+            playChime();
+            speak("Audio and vocal alerts verified active");
         }
 
         function setFilterMode(mode) {
@@ -1019,12 +1090,13 @@ HTML_TEMPLATE = r"""
         function toggleVoice() {
             voiceEnabled = !voiceEnabled;
             const btn = document.getElementById('voice-btn');
-            btn.className = voiceEnabled ? "bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold shadow-[0_0_10px_rgba(168,85,247,0.4)]" : "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
+            btn.className = voiceEnabled ? "bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition shadow-[0_0_10px_rgba(168,85,247,0.4)]" : "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
             if (voiceEnabled) speak("Vocal radar active");
         }
 
         function speak(text) {
             if (!voiceEnabled || !('speechSynthesis' in window)) return;
+            initAndUnlockAudio();
             window.speechSynthesis.cancel();
             const msg = new SpeechSynthesisUtterance(text);
             msg.rate = 1.05;
@@ -1035,8 +1107,7 @@ HTML_TEMPLATE = r"""
             audioEnabled = !audioEnabled;
             const btn = document.getElementById('audio-btn');
             if (audioEnabled) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                if (audioContext.state === 'suspended') audioContext.resume();
+                initAndUnlockAudio();
                 btn.innerText = "🔔"; btn.className = "bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold shadow-[0_0_10px_rgba(16,185,129,0.4)]";
                 playChime();
             } else {
@@ -1045,7 +1116,8 @@ HTML_TEMPLATE = r"""
         }
 
         function playChime() {
-            if (!audioEnabled || !audioContext) return;
+            if (!audioEnabled) return;
+            initAndUnlockAudio();
             try {
                 const now = audioContext.currentTime;
                 [523.25, 659.25, 783.99].forEach((freq, i) => {
@@ -1061,7 +1133,8 @@ HTML_TEMPLATE = r"""
         }
 
         function playTone(freq, dur) {
-            if (!audioEnabled || !audioContext) return;
+            if (!audioEnabled) return;
+            initAndUnlockAudio();
             try {
                 const osc = audioContext.createOscillator();
                 const gain = audioContext.createGain();
@@ -1074,7 +1147,8 @@ HTML_TEMPLATE = r"""
         }
 
         function playTransitChord() {
-            if (!audioEnabled || !audioContext) return;
+            if (!audioEnabled) return;
+            initAndUnlockAudio();
             try {
                 const now = audioContext.currentTime;
                 [880, 1108.73, 1318.51, 1760].forEach(f => {
@@ -1089,18 +1163,32 @@ HTML_TEMPLATE = r"""
             } catch (e) {}
         }
 
-        async function fetchTerrainElevation(lat, lon) {
+        async function fetchTerrainElevation(lat, lon, forceUpdate = false) {
             try {
                 const res = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}`);
                 const data = await res.json();
-                if (data.elevation) terrainElevationM = parseFloat(data.elevation[0]);
-            } catch (e) {}
+                if (data.elevation && data.elevation.length > 0) {
+                    terrainElevationM = Math.round(parseFloat(data.elevation[0]));
+                    localStorage.setItem('obs_terrain_m', terrainElevationM.toString());
+                    updateAltitudeDisplay();
+                    if (forceUpdate) fetchData();
+                }
+            } catch (e) {
+                updateAltitudeDisplay();
+            }
         }
 
-        function updateBuildingOffset(val) {
-            buildingOffsetM = Math.max(0, parseFloat(val) || 0);
-            localStorage.setItem('obs_building_m', buildingOffsetM.toString());
-            fetchData();
+        function updateAltitudeDisplay() {
+            const totalAlt = Math.round(terrainElevationM + buildingOffsetM);
+            const badge = document.getElementById('obs-alt-badge');
+            if (badge) badge.innerText = `⛰️ ${totalAlt}m`;
+
+            const tInput = document.getElementById('terrain-elevation-input');
+            const bInput = document.getElementById('building-offset');
+            const totalDisp = document.getElementById('total-alt-display');
+            if (tInput) tInput.value = terrainElevationM;
+            if (bInput) bInput.value = buildingOffsetM;
+            if (totalDisp) totalDisp.innerText = `${totalAlt}m`;
         }
 
         async function saveAndSetObserverPos(lat, lon) {
@@ -1108,7 +1196,7 @@ HTML_TEMPLATE = r"""
             localStorage.setItem('obs_lat', lat.toString());
             localStorage.setItem('obs_lon', lon.toString());
             document.getElementById('obs-coords').innerText = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-            fetchTerrainElevation(lat, lon);
+            await fetchTerrainElevation(lat, lon);
             drawRangeRings();
             renderAstroVectors();
             fetchData();
@@ -1249,7 +1337,7 @@ HTML_TEMPLATE = r"""
 
         async function fetchData() {
             try {
-                const totalObserverAlt = terrainElevationM + buildingOffsetM;
+                const totalObserverAlt = Math.round(terrainElevationM + buildingOffsetM);
                 const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}&lead=${userLeadSec}`);
                 const data = await res.json();
                 
@@ -1264,7 +1352,6 @@ HTML_TEMPLATE = r"""
                     document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
                 }
 
-                // Actualización de coordenadas celestes y badges con tabulación numérica
                 const mCoords = document.getElementById('moon-coords');
                 const mBadge = document.getElementById('moon-badge');
                 if (mCoords) mCoords.innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
@@ -1277,13 +1364,12 @@ HTML_TEMPLATE = r"""
 
                 renderAstroVectors();
 
-                // Telemetría del terminal Harvard
                 if (!terminalPaused) {
                     const term = document.getElementById('terminal-output');
                     const nowStr = new Date().toISOString().replace('T', ' ').slice(11, 23);
                     
                     const logEntry = document.createElement('div');
-                    logEntry.innerHTML = `[${nowStr}Z] <span class="text-cyan-400 font-bold">RADAR_KERNEL:</span> OBS=[${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}] | TARGETS=${data.aircraft ? data.aircraft.length : 0} | FEED=${data.source_feed} | LEAD=+${userLeadSec}s`;
+                    logEntry.innerHTML = `[${nowStr}Z] <span class="text-cyan-400 font-bold">RADAR_KERNEL:</span> OBS=[${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}] | ALT=${totalObserverAlt}m | TARGETS=${data.aircraft ? data.aircraft.length : 0} | FEED=${data.source_feed} | LEAD=+${userLeadSec}s`;
                     term.appendChild(logEntry);
 
                     if (data.aircraft) {
@@ -1386,7 +1472,6 @@ HTML_TEMPLATE = r"""
             } catch (err) {}
         }
 
-        // Animación suave Dead Reckoning a 60 FPS acelerada por hardware
         let lastAnimTime = performance.now();
         function animateFrame(nowMs) {
             const dt = Math.min(0.08, Math.max(0.001, (nowMs - lastAnimTime) / 1000.0));
@@ -1403,7 +1488,6 @@ HTML_TEMPLATE = r"""
             requestAnimationFrame(animateFrame);
         }
 
-        /* RETÍCULO ÓPTICO TÉCNICO DE TELESCOPIO CON GRADUACIONES CARDINALES */
         function renderTransitDiscDiagram(target) {
             const isSun = target.target === 'sun';
             const bodyColor = isSun ? '#fbbf24' : '#38bdf8';
@@ -1414,18 +1498,14 @@ HTML_TEMPLATE = r"""
             return `
                 <div class="flex items-center gap-2.5 bg-slate-950/90 p-2 rounded-lg border border-slate-800/90 mt-1 shadow-inner">
                     <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0 select-none">
-                        <!-- Círculos de escala exterior -->
                         <circle cx="24" cy="24" r="22" fill="none" stroke="#1e293b" stroke-width="1"/>
                         <circle cx="24" cy="24" r="18" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.4"/>
-                        <!-- Ejes ópticos cartesianos con graduaciones cardinales -->
                         <line x1="4" y1="24" x2="44" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
                         <line x1="24" y1="4" x2="24" y2="44" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <!-- Ticks cardinales -->
                         <line x1="24" y1="2" x2="24" y2="6" stroke="${bodyColor}" stroke-width="1.2"/>
                         <line x1="24" y1="42" x2="24" y2="46" stroke="${bodyColor}" stroke-width="1.2"/>
                         <line x1="2" y1="24" x2="6" y2="24" stroke="${bodyColor}" stroke-width="1.2"/>
                         <line x1="42" y1="24" x2="46" y2="24" stroke="${bodyColor}" stroke-width="1.2"/>
-                        <!-- Cuerda de tránsito con corte visible -->
                         <line x1="2" y1="${chordY.toFixed(1)}" x2="46" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
                     </svg>
                     <div class="flex flex-col text-[10px] leading-tight font-mono">
@@ -1440,7 +1520,6 @@ HTML_TEMPLATE = r"""
             `;
         }
 
-        /* HUD TELEMETRY CARDS MODULARES (POD LAYOUT PROFESIONAL) */
         function updateHUDCountdowns() {
             const container = document.getElementById('alerts-container');
             if (!activeAircraftData || activeAircraftData.length === 0) {
@@ -1532,7 +1611,6 @@ HTML_TEMPLATE = r"""
                     <div onclick="focusPlane('${plane.callsign}')" 
                          class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1.5 transition cursor-pointer hud-card">
                         
-                        <!-- ENCABEZADO DE LA TIRA DE TELEMETRÍA (POD 1) -->
                         <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5 font-mono">
                             <div class="flex items-center gap-1.5">
                                 <span class="font-black text-sm tracking-wide ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
@@ -1542,7 +1620,6 @@ HTML_TEMPLATE = r"""
                             ${tagHtml}
                         </div>
                         
-                        <!-- CAJA DIGITAL TCA Y CINEMÁTICA PRINCIPAL (POD 2 & 3) -->
                         <div class="grid grid-cols-3 gap-1.5 items-center font-mono my-0.5">
                             <div class="col-span-1 px-2 py-1 rounded bg-slate-950 border ${isTransit ? 'border-red-500/80 text-red-400' : (isClose ? 'border-amber-500/80 text-amber-400' : 'border-slate-800 text-cyan-400')} flex flex-col items-center justify-center">
                                 <span class="text-[7.5px] text-slate-500 uppercase font-bold tracking-wider">EST. TCA</span>
@@ -1556,7 +1633,6 @@ HTML_TEMPLATE = r"""
                             </div>
                         </div>
 
-                        <!-- METADATOS ÓPTICOS (POD 4) -->
                         <div class="flex justify-between items-center text-[9px] font-mono text-slate-400 border-t border-slate-800/60 pt-1">
                             <span>HDG: <b class="text-slate-200 tabular-nums">${plane.track}°</b></span>
                             <span>SPAN: <b class="text-slate-200 tabular-nums">${plane.wingspan_m}m</b></span>
@@ -1613,13 +1689,13 @@ HTML_TEMPLATE = r"""
         }
 
         document.getElementById('lead-display').innerText = (userLeadSec >= 0 ? '+' : '') + userLeadSec.toFixed(1) + 's';
-        document.getElementById('building-offset').value = buildingOffsetM.toString();
         document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
 
-        // Iconos vectoriales de la Luna y Sol en la barra superior
+        // Iconos vectoriales de la Luna y Sol en la cabecera
         document.getElementById('header-moon-icon').innerHTML = getRealisticMoonSvgHtml(20);
         document.getElementById('header-sun-icon').innerHTML = getRealisticSunSvgHtml(20);
 
+        updateAltitudeDisplay();
         drawRangeRings();
         fetchData();
         fetchTerrainElevation(observerLat, observerLon);
@@ -1634,9 +1710,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // AVIONICS HUD & HARVARD KERNEL")
-    print(f" [OK] Celestial Status Cards (Glow / Az / Alt / Events): RESTORED")
-    print(f" [OK] High-Performance POD Layout & Hardware Accelerated Sweep: ACTIVE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // AUDIO-DEFAULT & ALTITUDE ENGINE")
+    print(f" [OK] Audio & Voice Alerts: ACTIVE BY DEFAULT (Autoplay-Unlocked)")
+    print(f" [OK] Dual Elevation Controller (Manual + Auto-Detect): ACTIVE")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
