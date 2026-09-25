@@ -39,6 +39,15 @@ WINGSPANS = {
 def get_wingspan(model_icao):
     return WINGSPANS.get(model_icao, 35.0)
 
+def safe_float(val, default=None):
+    """Convierte de forma segura strings o números a float sin lanzar excepciones."""
+    if val is None or val == '' or val == 'null' or val == 'ground':
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 def calculate_atmosphere(alt_m):
     p_mbar = 1013.25 * math.pow((1.0 - 2.25577e-5 * max(0.0, alt_m)), 5.25588)
     t_c = 15.0 - (0.0065 * alt_m)
@@ -47,10 +56,12 @@ def calculate_atmosphere(alt_m):
 def compute_aircraft_refraction_deg(geom_alt_deg, slant_range_m, ac_alt_m, obs_alt_m, p_mbar, t_c):
     if geom_alt_deg < -0.5:
         return 0.0
-    refr_astro_arcmin = (p_mbar / 1013.25) * (288.15 / (273.15 + t_c)) * (
-        1.02 / math.tan(math.radians(max(0.05, geom_alt_deg + (10.3 / (geom_alt_deg + 5.11)))))
-    )
+    denom = math.tan(math.radians(max(0.05, geom_alt_deg + (10.3 / (geom_alt_deg + 5.11)))))
+    if abs(denom) < 1e-6:
+        return 0.0
+    refr_astro_arcmin = (p_mbar / 1013.25) * (288.15 / (273.15 + t_c)) * (1.02 / denom)
     refr_astro_deg = refr_astro_arcmin / 60.0
+
     delta_h = max(0.0, ac_alt_m - obs_alt_m)
     density_factor = 1.0 - math.exp(-delta_h / 8400.0)
     range_factor = min(1.0, slant_range_m / (slant_range_m + 2500.0))
@@ -61,10 +72,11 @@ def diff_angle_deg(a, b):
 
 def geodetic_to_ecef(lat_deg, lon_deg, h_m):
     lat, lon = math.radians(lat_deg), math.radians(lon_deg)
-    n = WGS84_A / math.sqrt(1.0 - WGS84_E2 * (math.sin(lat) ** 2))
+    sin_lat = math.sin(lat)
+    n = WGS84_A / math.sqrt(max(1e-9, 1.0 - WGS84_E2 * (sin_lat ** 2)))
     x = (n + h_m) * math.cos(lat) * math.cos(lon)
     y = (n + h_m) * math.cos(lat) * math.sin(lon)
-    z = (n * (1.0 - WGS84_E2) + h_m) * math.sin(lat)
+    z = (n * (1.0 - WGS84_E2) + h_m) * sin_lat
     return x, y, z
 
 def ecef_to_enu(x, y, z, lat0_deg, lon0_deg, h0_m):
@@ -81,7 +93,7 @@ def ecef_to_enu(x, y, z, lat0_deg, lon0_deg, h0_m):
 def enu_to_az_alt(e, n, u):
     ground = math.hypot(e, n)
     az = (math.degrees(math.atan2(e, n)) + 360.0) % 360.0
-    alt = math.degrees(math.atan2(u, ground))
+    alt = math.degrees(math.atan2(u, max(1e-3, ground)))
     slant = math.sqrt(e**2 + n**2 + u**2)
     return az, alt, slant
 
@@ -96,10 +108,12 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     track_r = math.radians(track_deg)
     lat_r = math.radians(lat_deg)
     lon_r = math.radians(lon_deg)
-    lat_future_r = math.asin(
-        math.sin(lat_r) * math.cos(d_r) + 
-        math.cos(lat_r) * math.sin(d_r) * math.cos(track_r)
-    )
+
+    # Clamping estricto para evitar ValueError en math.asin por redondeo flotante
+    sin_lat_future = math.sin(lat_r) * math.cos(d_r) + math.cos(lat_r) * math.sin(d_r) * math.cos(track_r)
+    sin_lat_future = max(-1.0, min(1.0, sin_lat_future))
+    lat_future_r = math.asin(sin_lat_future)
+
     lon_future_r = lon_r + math.atan2(
         math.sin(track_r) * math.sin(d_r) * math.cos(lat_r),
         math.cos(d_r) - math.sin(lat_r) * math.sin(lat_future_r)
@@ -107,7 +121,7 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# GESTIÓN DE CACHÉ ADS-B
+# 2. GESTIÓN DE CACHÉ ADS-B CON TIMEOUTS OPTIMIZADOS
 # =========================================================================
 CACHE = {
     'lat': 0.0, 'lon': 0.0, 'timestamp': 0.0, 'aircraft': [], 'source': 'airplanes.live'
@@ -116,14 +130,15 @@ HTTP_SESSION = requests.Session()
 
 def get_live_aircraft(cur_lat, cur_lon):
     now = time.time()
-    if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
+    if now - CACHE['timestamp'] < 2.0 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
         return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/26.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/26.1'}
     
+    # 1. airplanes.live (Timeout ajustado a 1.8s)
     try:
         url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
+        r = HTTP_SESSION.get(url, headers=headers, timeout=1.8)
         if r.status_code == 200:
             data = r.json()
             ac = data.get('ac', [])
@@ -133,9 +148,10 @@ def get_live_aircraft(cur_lat, cur_lon):
     except Exception:
         pass
 
+    # 2. adsb.lol (Fallback con timeout de 1.8s)
     try:
         url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
+        r = HTTP_SESSION.get(url, headers=headers, timeout=1.8)
         if r.status_code == 200:
             data = r.json()
             ac = data.get('ac', [])
@@ -148,7 +164,7 @@ def get_live_aircraft(cur_lat, cur_lon):
     return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
 # =========================================================================
-# MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
+# 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
 # =========================================================================
 @app.route('/api/data')
 def get_data():
@@ -170,7 +186,8 @@ def get_data():
         m_alt, m_az, m_dist = app_moon.altaz(pressure_mbar=p_mbar, temperature_C=t_c)
         moon_az0 = float(m_az.degrees)
         moon_alt0 = float(m_alt.degrees)
-        moon_radius_deg = float(math.degrees(math.asin(MOON_RADIUS_KM / m_dist.km)))
+        moon_dist_km = max(1000.0, float(m_dist.km))
+        moon_radius_deg = float(math.degrees(math.asin(min(1.0, MOON_RADIUS_KM / moon_dist_km))))
         moon_is_visible = bool(moon_alt0 > -0.5)
 
         # 2. Astrometría Solar
@@ -178,7 +195,8 @@ def get_data():
         s_alt, s_az, s_dist = app_sun.altaz(pressure_mbar=p_mbar, temperature_C=t_c)
         sun_az0 = float(s_az.degrees)
         sun_alt0 = float(s_alt.degrees)
-        sun_radius_deg = float(math.degrees(math.asin(SUN_RADIUS_KM / s_dist.km)))
+        sun_dist_km = max(1000.0, float(s_dist.km))
+        sun_radius_deg = float(math.degrees(math.asin(min(1.0, SUN_RADIUS_KM / sun_dist_km))))
         sun_is_visible = bool(sun_alt0 > -0.5)
 
         dt_future = datetime.now(timezone.utc) + timedelta(seconds=300)
@@ -220,40 +238,38 @@ def get_data():
         aircraft_results = []
 
         for ac in raw_ac:
-            raw_lat = ac.get('lat')
-            raw_lon = ac.get('lon')
-            track = ac.get('track')
-            gs = ac.get('gs', 0)
-            vr_raw = ac.get('geom_rate', ac.get('baro_rate', 0))
-            model_icao = str(ac.get('t', 'A320')).strip().upper()
-            wingspan_m = get_wingspan(model_icao)
+            # 1. Parseo seguro de ADS-B con descarte aislado si hay datos corruptos
+            ac_lat = safe_float(ac.get('lat'))
+            ac_lon = safe_float(ac.get('lon'))
+            track_val = safe_float(ac.get('track'))
+            gs_val = safe_float(ac.get('gs'))
 
-            alt_geom = ac.get('alt_geom')
-            alt_baro = ac.get('alt_baro')
-            if alt_geom is not None and alt_geom != 'ground':
-                alt_ft = float(alt_geom)
+            if None in (ac_lat, ac_lon, track_val, gs_val) or gs_val <= 15.0:
+                continue
+
+            alt_geom = safe_float(ac.get('alt_geom'))
+            alt_baro = safe_float(ac.get('alt_baro'))
+
+            if alt_geom is not None and alt_geom > -1000.0:
+                alt_ft = alt_geom
                 alt_type = 'GNSS'
-            elif alt_baro is not None and alt_baro != 'ground':
-                alt_ft = float(alt_baro)
+            elif alt_baro is not None and alt_baro > -1000.0:
+                alt_ft = alt_baro
                 alt_type = 'BARO'
             else:
                 continue
 
-            if None in (raw_lat, raw_lon, track) or gs is None or float(gs) <= 15:
-                continue
+            vr_raw = safe_float(ac.get('geom_rate', ac.get('baro_rate', 0.0)), default=0.0)
+            vr_ms = vr_raw * 0.00508
+            vr_fpm = int(vr_raw)
+            model_icao = str(ac.get('t', 'A320')).strip().upper()
+            wingspan_m = get_wingspan(model_icao)
 
-            try:
-                alt_m = alt_ft * 0.3048
-                speed_ms = float(gs) * 0.514444
-                vr_ms = float(vr_raw) * 0.00508 if vr_raw else 0.0
-                vr_fpm = int(float(vr_raw)) if vr_raw else 0
-                track_val = float(track)
-                ac_lat = float(raw_lat)
-                ac_lon = float(raw_lon)
-            except (ValueError, TypeError):
-                continue
+            alt_m = alt_ft * 0.3048
+            speed_ms = gs_val * 0.514444
 
-            seen_pos = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
+            # Compensación cinemática exacta de la latencia ADS-B
+            seen_pos = safe_float(ac.get('seen_pos', ac.get('seen', 0.0)), default=0.0)
             seen_pos = max(0.0, min(15.0, seen_pos))
             if seen_pos > 0.05:
                 ac_lat, ac_lon = propagate_geodetic_position(ac_lat, ac_lon, speed_ms, track_val, seen_pos)
@@ -270,6 +286,7 @@ def get_data():
             vn = speed_ms * math.cos(track_rad)
             vu = vr_ms
 
+            # 2. Motor de intercepción TCA adaptativo (Sin trampas de ventana)
             def compute_body_intercept(body_type, b_az0, b_alt0, b_rad, d_az, d_alt, is_vis):
                 if not is_vis:
                     return {
@@ -302,6 +319,7 @@ def get_data():
                     sep = angular_separation(p_az, p_app_alt, b_az_t, b_alt_t)
                     return sep, p_az, p_app_alt, p_range, p_lat, p_lon
 
+                # Estimación analítica inicial
                 b_rad_az = math.radians(b_az0)
                 b_rad_alt = math.radians(b_alt0)
                 bx = math.cos(b_rad_alt) * math.sin(b_rad_az)
@@ -318,7 +336,8 @@ def get_data():
                 if denom > 1e-4:
                     t_analytical = (r_dot_b * v_dot_b - r_dot_v) / denom
 
-                if t_analytical < -3.0 and cur_sep > (b_rad * 4.0):
+                # Si el avión se aleja definitivamente del astro, abortamos de inmediato
+                if t_analytical < -5.0 and cur_sep > (b_rad * 4.0):
                     return {
                         'target': body_type, 'is_transit': False, 'is_close': False,
                         'min_sep': round(cur_sep, 3), 'current_sep': round(cur_sep, 2),
@@ -330,15 +349,18 @@ def get_data():
                         'tca_lat': ac_lat, 'tca_lon': ac_lon
                     }
 
+                # Ventana adaptativa amplia (±25s) para corregir el movimiento del astro y la curvatura terrestre
                 center_t = max(0.0, min(300.0, t_analytical if t_analytical > 0 else 0.0))
-                scan_min = max(0.0, center_t - 7.5)
-                scan_max = min(300.0, center_t + 7.5)
+                scan_min = max(0.0, center_t - 25.0)
+                scan_max = min(300.0, center_t + 25.0)
                 
-                best_t = center_t
-                min_sep, _, best_p_alt, best_p_range, best_lat, best_lon = eval_t(best_t)
+                best_t = 0.0
+                min_sep, _, best_p_alt, best_p_range, best_lat, best_lon = eval_t(0.0)
 
-                for step in range(16):
-                    t_cand = scan_min + (step / 15.0) * (scan_max - scan_min)
+                # Muestreo preliminar para hallar la cuenca del mínimo
+                num_steps = 20
+                for step in range(num_steps + 1):
+                    t_cand = scan_min + (step / float(num_steps)) * (scan_max - scan_min)
                     sep_val, _, p_alt_val, p_range_val, cand_lat, cand_lon = eval_t(t_cand)
                     if sep_val < min_sep:
                         min_sep = sep_val
@@ -347,8 +369,9 @@ def get_data():
                         best_p_range = p_range_val
                         best_lat, best_lon = cand_lat, cand_lon
 
-                a = max(0.0, best_t - 1.2)
-                b = min(300.0, best_t + 1.2)
+                # Refinado de Sección Áurea centrado en el mínimo real encontrado
+                a = max(0.0, best_t - 2.5)
+                b = min(300.0, best_t + 2.5)
                 phi = (1.0 + math.sqrt(5.0)) / 2.0
                 resphi = 2.0 - phi
 
@@ -357,7 +380,7 @@ def get_data():
                 f1, _, _, _, _, _ = eval_t(x1)
                 f2, _, _, _, _, _ = eval_t(x2)
 
-                for _ in range(12):
+                for _ in range(14):
                     if f1 < f2:
                         b = x2
                         x2 = x1
@@ -400,7 +423,7 @@ def get_data():
 
                 ang_size_rad = 2.0 * math.atan2(wingspan_m, 2.0 * max(100.0, best_p_range))
                 ang_size_arcsec = round(math.degrees(ang_size_rad) * 3600.0, 1)
-                disk_coverage_pct = round((ang_size_arcsec / (body_diam_deg * 3600.0)) * 100.0, 1)
+                disk_coverage_pct = round((ang_size_arcsec / max(1.0, (body_diam_deg * 3600.0))) * 100.0, 1)
 
                 symbol = "🌕" if body_type == 'moon' else "☀️"
                 name = "Lunar" if body_type == 'moon' else "Solar"
@@ -453,7 +476,7 @@ def get_data():
                 'alt_ft': int(alt_ft),
                 'alt_type': alt_type,
                 'track': float(round(track_val, 1)),
-                'speed_kt': int(float(gs)),
+                'speed_kt': int(round(gs_val)),
                 'speed_ms': float(round(speed_ms, 1)),
                 'vr_fpm': vr_fpm,
                 'azimuth': float(round(cur_az, 1)),
@@ -487,7 +510,7 @@ def get_data():
         return jsonify({'error': str(e), 'aircraft': []})
 
 # =========================================================================
-# RUTAS DE INDEXACIÓN Y PLANTILLA HTML
+# 4. RUTAS DE INDEXACIÓN Y PLANTILLA HTML
 # =========================================================================
 @app.route('/google92a4c5b46b2ec0bf.html')
 def google_verification():
@@ -498,7 +521,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# WEB UI (LUNAR TRANSIT RADAR PRO - TACTICAL AVIONICS HUD)
+# 5. FRONTEND AVIONICS HUD
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -517,7 +540,6 @@ HTML_TEMPLATE = r"""
         .map-container { height: calc(100dvh - 114px); width: 100%; border-radius: 12px; }
         .leaflet-container { background: #040711 !important; }
         
-        /* CORRECCIÓN FUNDAMENTAL DE LEAFLET: Elimina el fondo blanco de los marcadores */
         .leaflet-div-icon {
             background: transparent !important;
             border: none !important;
@@ -528,7 +550,6 @@ HTML_TEMPLATE = r"""
         .obs-dot { width: 10px; height: 10px; border-radius: 50%; background: #22d3ee; border: 2px solid #ffffff; box-shadow: 0 0 14px #06b6d4; z-index: 10; }
         @keyframes pulse-ring { 0% { transform: scale(0.5); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
 
-        /* Retículo de intercepción táctico en mapa */
         .tca-target { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; }
         .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; }
         .tca-crosshair-h { position: absolute; width: 28px; height: 1.5px; background: rgba(239, 68, 68, 0.8); }
@@ -536,7 +557,6 @@ HTML_TEMPLATE = r"""
         .tca-core { width: 6px; height: 6px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 12px #ef4444; z-index: 10; }
         @keyframes tca-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
-        /* Estética de consola de aviónica militar */
         .avionics-panel { 
             background: linear-gradient(180deg, rgba(15, 23, 42, 0.94) 0%, rgba(6, 11, 25, 0.97) 100%);
             backdrop-filter: blur(12px);
@@ -568,7 +588,6 @@ HTML_TEMPLATE = r"""
 </head>
 <body class="p-1.5 md:p-2 flex flex-col h-[100dvh] overflow-hidden select-none">
     
-    <!-- BARRA SUPERIOR DE TELEMETRÍA Y CONTROLES -->
     <header class="avionics-panel px-3 py-1.5 rounded-xl mb-1.5 flex flex-wrap justify-between items-center gap-2 shadow-2xl">
         <div class="flex items-center gap-2">
             <span class="text-2xl animate-pulse">🌔</span>
@@ -581,7 +600,6 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
         
-        <!-- ESTADO DE CUERPOS CELESTES CON ICONOS REALISTAS -->
         <div class="flex items-center gap-1.5 text-xs">
             <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-900/60 flex items-center gap-2 cursor-pointer hover:border-cyan-400 transition glow-cyan" onclick="setFilterMode('moon')">
                 <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
@@ -610,7 +628,6 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- SELECTORES Y BOTONES DE ACCIÓN -->
         <div class="flex items-center gap-1.5">
             <div class="bg-slate-950 p-0.5 rounded-lg border border-slate-800 flex">
                 <button id="btn-flt-moon" onclick="setFilterMode('moon')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">🌔 Moon</button>
@@ -626,10 +643,8 @@ HTML_TEMPLATE = r"""
         </div>
     </header>
 
-    <!-- GRID PRINCIPAL -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-1.5 flex-grow overflow-hidden">
         
-        <!-- MAPA TÁCTICO CON RANGOS Y ANILLOS -->
         <div class="lg:col-span-3 rounded-xl overflow-hidden border border-slate-800 relative shadow-2xl flex flex-col">
             <div id="map" class="map-container"></div>
             
@@ -649,7 +664,6 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- TELEMETRÍA Y ALERTAS HUD -->
         <div class="avionics-panel rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 shadow-2xl max-h-[42vh] lg:max-h-full">
             <div class="flex justify-between items-center border-b border-slate-800 pb-1.5">
                 <h2 class="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
@@ -821,7 +835,7 @@ HTML_TEMPLATE = r"""
         function drawRangeRings() {
             rangeCircles.forEach(c => map.removeLayer(c));
             rangeCircles = [];
-            [15000, 30000, 50000].forEach((r, idx) => {
+            [15000, 30000, 50000].forEach((r) => {
                 const circle = L.circle([observerLat, observerLon], {
                     radius: r,
                     color: '#06b6d4',
@@ -1027,9 +1041,6 @@ HTML_TEMPLATE = r"""
             return '#a855f7';
         }
 
-        /* =========================================================================
-           SVG VECTORIAL ASTRONÓMICO DE LA LUNA (CARA VISIBLE REALISTA)
-           ========================================================================= */
         function getRealisticMoonSvgHtml(size = 38) {
             return `
                 <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 10px rgba(56,189,248,0.7));">
@@ -1045,52 +1056,32 @@ HTML_TEMPLATE = r"""
                                 <circle cx="50" cy="50" r="46" />
                             </clipPath>
                         </defs>
-                        
-                        <!-- Base esférica con oscurecimiento de limbo -->
                         <circle cx="50" cy="50" r="46" fill="url(#lunarLimbGrad)" stroke="#38bdf8" stroke-width="1.2"/>
-                        
-                        <!-- Topografía real de mares lunares (Basalto oscuro) -->
                         <g clip-path="url(#lunarSphereClip)">
-                            <!-- Oceanus Procellarum & Mare Imbrium -->
                             <path d="M 18,36 C 14,48 18,68 30,72 C 38,72 40,62 38,50 C 36,40 28,32 18,36 Z" fill="#334155" opacity="0.68"/>
                             <circle cx="39" cy="34" r="12" fill="#334155" opacity="0.72"/>
-                            
-                            <!-- Mare Serenitatis -->
                             <circle cx="59" cy="35" r="8.5" fill="#334155" opacity="0.7"/>
-                            
-                            <!-- Mare Tranquillitatis -->
                             <ellipse cx="67" cy="48" rx="9" ry="8" fill="#334155" opacity="0.75"/>
-                            
-                            <!-- Mare Crisium (Óvalo aislado característico del este lunar) -->
                             <ellipse cx="80" cy="38" rx="5.5" ry="4.5" fill="#1e293b" opacity="0.85"/>
-                            
-                            <!-- Mare Fecunditatis & Nectaris -->
                             <ellipse cx="73" cy="60" rx="8" ry="7" fill="#334155" opacity="0.7"/>
                             <circle cx="65" cy="63" r="5" fill="#334155" opacity="0.65"/>
-                            
-                            <!-- Mare Nubium & Humorum -->
                             <ellipse cx="40" cy="64" rx="8" ry="7" fill="#334155" opacity="0.7"/>
                             <circle cx="27" cy="63" r="4.5" fill="#334155" opacity="0.65"/>
-                            
-                            <!-- Sistema de rayos del cráter Tycho (Polo Sur) -->
                             <line x1="48" y1="80" x2="30" y2="60" stroke="#ffffff" stroke-width="0.75" opacity="0.65"/>
                             <line x1="48" y1="80" x2="68" y2="65" stroke="#ffffff" stroke-width="0.75" opacity="0.65"/>
                             <line x1="48" y1="80" x2="48" y2="40" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
                             <line x1="48" y1="80" x2="18" y2="82" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
                             <line x1="48" y1="80" x2="76" y2="82" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
                             <circle cx="48" cy="80" r="2.4" fill="#ffffff"/>
-                            
-                            <!-- Cráteres icónicos de impacto -->
-                            <circle cx="36" cy="44" r="2.2" fill="#ffffff" opacity="0.95"/> <!-- Copérnico -->
-                            <circle cx="26" cy="45" r="1.6" fill="#ffffff" opacity="0.9"/>  <!-- Kepler -->
-                            <circle cx="24" cy="33" r="1.8" fill="#ffffff" opacity="1.0"/>  <!-- Aristarco (punto más brillante) -->
+                            <circle cx="36" cy="44" r="2.2" fill="#ffffff" opacity="0.95"/>
+                            <circle cx="26" cy="45" r="1.6" fill="#ffffff" opacity="0.9"/>
+                            <circle cx="24" cy="33" r="1.8" fill="#ffffff" opacity="1.0"/>
                         </g>
                     </svg>
                 </div>
             `;
         }
 
-        /* SVG VECTORIAL DEL SOL CON CORONA Y GRANULACIÓN */
         function getRealisticSunSvgHtml(size = 38) {
             return `
                 <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 12px rgba(245,158,11,0.9));">
@@ -1105,7 +1096,6 @@ HTML_TEMPLATE = r"""
                         </defs>
                         <circle cx="50" cy="50" r="44" fill="none" stroke="#fef08a" stroke-width="1.5" stroke-dasharray="4, 4" opacity="0.8" />
                         <circle cx="50" cy="50" r="38" fill="url(#solarDiscGrad)" stroke="#fde047" stroke-width="1.8" />
-                        <!-- Mancha solar / Región activa -->
                         <ellipse cx="44" cy="42" rx="2" ry="1.5" fill="#78350f" opacity="0.75"/>
                         <ellipse cx="58" cy="46" rx="2.5" ry="1.8" fill="#78350f" opacity="0.75"/>
                     </svg>
@@ -1291,11 +1281,11 @@ HTML_TEMPLATE = r"""
             requestAnimationFrame(animateFrame);
         }
 
-        /* RETÍCULO TÉCNICO DE TELESCOPIO (VISOR DE TRÁNSITO) */
         function renderTransitDiscDiagram(target) {
             const isSun = target.target === 'sun';
             const bodyColor = isSun ? '#fbbf24' : '#38bdf8';
-            const normOffset = Math.max(-1.7, Math.min(1.7, target.vertical_offset_deg / (isSun ? sunDataGlobal.radius_deg : moonDataGlobal.radius_deg)));
+            const bodyRad = isSun ? (sunDataGlobal.radius_deg || 0.26) : (moonDataGlobal.radius_deg || 0.26);
+            const normOffset = Math.max(-1.7, Math.min(1.7, target.vertical_offset_deg / Math.max(0.01, bodyRad)));
             const chordY = 24 - (normOffset * 11);
 
             return `
@@ -1303,10 +1293,8 @@ HTML_TEMPLATE = r"""
                     <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0">
                         <circle cx="24" cy="24" r="19" fill="#030712" stroke="${bodyColor}" stroke-width="1.2" stroke-dasharray="3, 2"/>
                         <circle cx="24" cy="24" r="16" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.5"/>
-                        <!-- Ejes ópticos cartesianos -->
                         <line x1="5" y1="24" x2="43" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
                         <line x1="24" y1="5" x2="24" y2="43" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <!-- Cuerda de tránsito proyectada -->
                         <line x1="3" y1="${chordY.toFixed(1)}" x2="45" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
                     </svg>
                     <div class="flex flex-col text-[10px] leading-tight">
@@ -1421,7 +1409,6 @@ HTML_TEMPLATE = r"""
                     <div onclick="focusPlane('${plane.callsign}')" 
                          class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1 transition cursor-pointer hud-card">
                         
-                        <!-- Header de la tira de vuelo -->
                         <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5">
                             <div class="flex items-center gap-1.5 font-mono">
                                 <span class="font-black text-sm tracking-wide ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
@@ -1431,7 +1418,6 @@ HTML_TEMPLATE = r"""
                             ${tagHtml}
                         </div>
                         
-                        <!-- Telemetría en formato avionics grid -->
                         <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] font-mono text-slate-300 mt-0.5">
                             <div><span class="text-slate-500">ALT:</span> <b>${plane.alt_ft.toLocaleString()} ft</b></div>
                             <div><span class="text-slate-500">V/S:</span> <b>${plane.vr_fpm > 0 ? '+' : ''}${plane.vr_fpm} ft/m</b></div>
@@ -1496,7 +1482,6 @@ HTML_TEMPLATE = r"""
         document.getElementById('building-offset').value = buildingOffsetM.toString();
         document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
 
-        // Cargar mini-iconos vectoriales en la barra superior
         document.getElementById('header-moon-icon').innerHTML = getRealisticMoonSvgHtml(20);
         document.getElementById('header-sun-icon').innerHTML = getRealisticSunSvgHtml(20);
 
@@ -1514,10 +1499,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO - TACTICAL AVIONICS ENGINE")
-    print(f" [OK] Realistic Lunar Surface & Vector Corona: LOADED")
-    print(f" [OK] Tropospheric Refraction & Latency Siphon: ACTIVE")
-    print(f" [OK] CARTO Basemap & Audio Engine: ONLINE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO - BULLETPROOF ENGINE LOADED")
+    print(f" [OK] Adaptive Search Basin & Clamped Trigonometry: ACTIVE")
+    print(f" [OK] Realistic Lunar Surface & Vector Corona: ONLINE")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
