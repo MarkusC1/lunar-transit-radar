@@ -45,18 +45,15 @@ def calculate_atmosphere(alt_m):
     return max(300.0, p_mbar), t_c
 
 def compute_aircraft_refraction_deg(geom_alt_deg, slant_range_m, ac_alt_m, obs_alt_m, p_mbar, t_c):
-    """Calcula la refracción aparente que experimenta el haz lumínico del avión hacia el observador."""
     if geom_alt_deg < -0.5:
         return 0.0
     refr_astro_arcmin = (p_mbar / 1013.25) * (288.15 / (273.15 + t_c)) * (
         1.02 / math.tan(math.radians(max(0.05, geom_alt_deg + (10.3 / (geom_alt_deg + 5.11)))))
     )
     refr_astro_deg = refr_astro_arcmin / 60.0
-
     delta_h = max(0.0, ac_alt_m - obs_alt_m)
     density_factor = 1.0 - math.exp(-delta_h / 8400.0)
     range_factor = min(1.0, slant_range_m / (slant_range_m + 2500.0))
-
     return refr_astro_deg * density_factor * range_factor
 
 def diff_angle_deg(a, b):
@@ -76,7 +73,6 @@ def ecef_to_enu(x, y, z, lat0_deg, lon0_deg, h0_m):
     lat0, lon0 = math.radians(lat0_deg), math.radians(lon0_deg)
     sin_l, cos_l = math.sin(lat0), math.cos(lat0)
     sin_o, cos_o = math.sin(lon0), math.cos(lon0)
-    
     e = -sin_o * dx + cos_o * dy
     n = -sin_l * cos_o * dx - sin_l * sin_o * dy + cos_l * dz
     u = cos_l * cos_o * dx + cos_l * sin_o * dy + sin_l * dz
@@ -100,7 +96,6 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     track_r = math.radians(track_deg)
     lat_r = math.radians(lat_deg)
     lon_r = math.radians(lon_deg)
-
     lat_future_r = math.asin(
         math.sin(lat_r) * math.cos(d_r) + 
         math.cos(lat_r) * math.sin(d_r) * math.cos(track_r)
@@ -112,14 +107,10 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# GESTIÓN DE CACHÉ Y OBTENCIÓN ADS-B
+# GESTIÓN DE CACHÉ ADS-B
 # =========================================================================
 CACHE = {
-    'lat': 0.0,
-    'lon': 0.0,
-    'timestamp': 0.0,
-    'aircraft': [],
-    'source': 'airplanes.live'
+    'lat': 0.0, 'lon': 0.0, 'timestamp': 0.0, 'aircraft': [], 'source': 'airplanes.live'
 }
 HTTP_SESSION = requests.Session()
 
@@ -130,7 +121,6 @@ def get_live_aircraft(cur_lat, cur_lon):
 
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/26.0'}
     
-    # 1. airplanes.live
     try:
         url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
         r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
@@ -138,16 +128,11 @@ def get_live_aircraft(cur_lat, cur_lon):
             data = r.json()
             ac = data.get('ac', [])
             if ac:
-                CACHE['lat'] = cur_lat
-                CACHE['lon'] = cur_lon
-                CACHE['timestamp'] = now
-                CACHE['aircraft'] = ac
-                CACHE['source'] = 'airplanes.live'
+                CACHE['lat'], CACHE['lon'], CACHE['timestamp'], CACHE['aircraft'], CACHE['source'] = cur_lat, cur_lon, now, ac, 'airplanes.live'
                 return ac, 'airplanes.live', 0.0
     except Exception:
         pass
 
-    # 2. adsb.lol
     try:
         url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
         r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
@@ -155,11 +140,7 @@ def get_live_aircraft(cur_lat, cur_lon):
             data = r.json()
             ac = data.get('ac', [])
             if ac:
-                CACHE['lat'] = cur_lat
-                CACHE['lon'] = cur_lon
-                CACHE['timestamp'] = now
-                CACHE['aircraft'] = ac
-                CACHE['source'] = 'adsb.lol'
+                CACHE['lat'], CACHE['lon'], CACHE['timestamp'], CACHE['aircraft'], CACHE['source'] = cur_lat, cur_lon, now, ac, 'adsb.lol'
                 return ac, 'adsb.lol', 0.0
     except Exception:
         pass
@@ -200,7 +181,6 @@ def get_data():
         sun_radius_deg = float(math.degrees(math.asin(SUN_RADIUS_KM / s_dist.km)))
         sun_is_visible = bool(sun_alt0 > -0.5)
 
-        # Derivadas angulares (a 300 segundos)
         dt_future = datetime.now(timezone.utc) + timedelta(seconds=300)
         t_300 = ts.from_datetime(dt_future)
         
@@ -273,7 +253,6 @@ def get_data():
             except (ValueError, TypeError):
                 continue
 
-            # Compensación cinemática exacta de la latencia ADS-B
             seen_pos = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
             seen_pos = max(0.0, min(15.0, seen_pos))
             if seen_pos > 0.05:
@@ -508,7 +487,7 @@ def get_data():
         return jsonify({'error': str(e), 'aircraft': []})
 
 # =========================================================================
-# RUTAS Y FRONTEND DE ALTA PRECISIÓN
+# RUTAS DE INDEXACIÓN Y PLANTILLA HTML
 # =========================================================================
 @app.route('/google92a4c5b46b2ec0bf.html')
 def google_verification():
@@ -518,6 +497,9 @@ def google_verification():
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+# =========================================================================
+# WEB UI (LUNAR TRANSIT RADAR PRO - TACTICAL AVIONICS HUD)
+# =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="es">
@@ -531,65 +513,92 @@ HTML_TEMPLATE = r"""
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #050811; color: #f8fafc; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        body { background-color: #040711; color: #f1f5f9; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
         .map-container { height: calc(100dvh - 114px); width: 100%; border-radius: 12px; }
-        .leaflet-container { background: #050811 !important; }
+        .leaflet-container { background: #040711 !important; }
         
-        /* CORRECCIÓN CRÍTICA DE LEAFLET: Elimina el fondo blanco predeterminado */
+        /* CORRECCIÓN FUNDAMENTAL DE LEAFLET: Elimina el fondo blanco de los marcadores */
         .leaflet-div-icon {
             background: transparent !important;
             border: none !important;
         }
 
-        .obs-target { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; }
-        .obs-ring { position: absolute; width: 32px; height: 32px; border-radius: 50%; background: rgba(6, 182, 212, 0.22); border: 2px solid #06b6d4; animation: pulse-ring 2s infinite ease-out; }
+        .obs-target { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; }
+        .obs-ring { position: absolute; width: 34px; height: 34px; border-radius: 50%; background: rgba(6, 182, 212, 0.18); border: 2px solid #06b6d4; animation: pulse-ring 2.2s infinite ease-out; }
         .obs-dot { width: 10px; height: 10px; border-radius: 50%; background: #22d3ee; border: 2px solid #ffffff; box-shadow: 0 0 14px #06b6d4; z-index: 10; }
         @keyframes pulse-ring { 0% { transform: scale(0.5); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
 
-        /* Retícula de intercepción TCA en mapa */
-        .tca-target { display: flex; align-items: center; justify-content: center; width: 26px; height: 26px; }
-        .tca-ring { position: absolute; width: 26px; height: 26px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3.5s linear infinite; }
-        .tca-crosshair-h { position: absolute; width: 26px; height: 1.5px; background: rgba(239, 68, 68, 0.7); }
-        .tca-crosshair-v { position: absolute; width: 1.5px; height: 26px; background: rgba(239, 68, 68, 0.7); }
+        /* Retículo de intercepción táctico en mapa */
+        .tca-target { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; }
+        .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; }
+        .tca-crosshair-h { position: absolute; width: 28px; height: 1.5px; background: rgba(239, 68, 68, 0.8); }
+        .tca-crosshair-v { position: absolute; width: 1.5px; height: 28px; background: rgba(239, 68, 68, 0.8); }
         .tca-core { width: 6px; height: 6px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 12px #ef4444; z-index: 10; }
         @keyframes tca-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
-        .glass-panel { background: rgba(11, 17, 32, 0.90); backdrop-filter: blur(10px); border: 1px solid rgba(51, 65, 85, 0.7); }
-        .hud-card { transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); }
-        .hud-card:hover { transform: translateY(-1px); border-color: rgba(6, 182, 212, 0.6); }
+        /* Estética de consola de aviónica militar */
+        .avionics-panel { 
+            background: linear-gradient(180deg, rgba(15, 23, 42, 0.94) 0%, rgba(6, 11, 25, 0.97) 100%);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.6);
+        }
+
+        .hud-card { 
+            position: relative;
+            background: rgba(10, 16, 31, 0.78);
+            border: 1px solid rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(8px);
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .hud-card:hover { 
+            transform: translateY(-1px); 
+            border-color: rgba(6, 182, 212, 0.7);
+            box-shadow: 0 0 18px rgba(6, 182, 212, 0.15);
+        }
+
+        .glow-cyan { box-shadow: 0 0 14px rgba(6, 182, 212, 0.25); }
+        .glow-amber { box-shadow: 0 0 14px rgba(245, 158, 11, 0.25); }
+        .glow-red { box-shadow: 0 0 20px rgba(239, 68, 68, 0.35); }
 
         ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: #050811; }
+        ::-webkit-scrollbar-track { background: #040711; }
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
     </style>
 </head>
 <body class="p-1.5 md:p-2 flex flex-col h-[100dvh] overflow-hidden select-none">
     
     <!-- BARRA SUPERIOR DE TELEMETRÍA Y CONTROLES -->
-    <header class="glass-panel px-3 py-1.5 rounded-xl mb-1.5 flex flex-wrap justify-between items-center gap-2 shadow-2xl">
+    <header class="avionics-panel px-3 py-1.5 rounded-xl mb-1.5 flex flex-wrap justify-between items-center gap-2 shadow-2xl">
         <div class="flex items-center gap-2">
             <span class="text-2xl animate-pulse">🌔</span>
             <div>
                 <h1 class="text-xs font-black text-amber-400 tracking-wider">LUNAR RADAR PRO</h1>
-                <div class="flex items-center gap-1">
-                    <span id="feed-badge" class="text-[8px] px-1 py-0.2 bg-emerald-950 text-emerald-300 border border-emerald-700 rounded font-bold">ONLINE</span>
-                    <span class="text-[8px] px-1 py-0.2 bg-indigo-950 text-indigo-300 border border-indigo-700 rounded font-mono">DE421 + WGS84</span>
+                <div class="flex items-center gap-1 font-mono text-[8px]">
+                    <span id="feed-badge" class="px-1 py-0.2 bg-emerald-950 text-emerald-300 border border-emerald-700/80 rounded font-bold">ONLINE</span>
+                    <span class="px-1 py-0.2 bg-indigo-950 text-indigo-300 border border-indigo-700/80 rounded">DE421 + WGS84</span>
                 </div>
             </div>
         </div>
         
-        <!-- ESTADO DE CUERPOS CELESTES -->
+        <!-- ESTADO DE CUERPOS CELESTES CON ICONOS REALISTAS -->
         <div class="flex items-center gap-1.5 text-xs">
-            <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-900/60 flex items-center gap-1.5 cursor-pointer hover:border-cyan-400 transition" onclick="setFilterMode('moon')">
-                <span class="text-sm">🌕</span>
-                <span id="moon-coords" class="text-cyan-300 font-bold text-[11px]">Moon: Az --° | Alt --°</span>
-                <span id="moon-badge" class="text-[9px] px-1 bg-cyan-950 text-cyan-400 rounded border border-cyan-800 font-mono">--:--</span>
+            <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-900/60 flex items-center gap-2 cursor-pointer hover:border-cyan-400 transition glow-cyan" onclick="setFilterMode('moon')">
+                <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
+                <div class="flex flex-col">
+                    <span id="moon-coords" class="text-cyan-300 font-bold text-[11px] leading-tight">Moon: Az --° | Alt --°</span>
+                    <span class="text-[8px] text-slate-400 font-mono">OPTICAL VECTOR LOCK</span>
+                </div>
+                <span id="moon-badge" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 text-cyan-400 rounded border border-cyan-800 font-mono font-bold">--:--</span>
             </div>
 
-            <div id="sun-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-900/40 flex items-center gap-1.5 cursor-pointer hover:border-amber-400 transition opacity-80" onclick="setFilterMode('sun')">
-                <span class="text-sm">☀️</span>
-                <span id="sun-coords" class="text-amber-300 font-bold text-[11px]">Sun: Az --° | Alt --°</span>
-                <span id="sun-badge" class="text-[9px] px-1 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono">--:--</span>
+            <div id="sun-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-900/40 flex items-center gap-2 cursor-pointer hover:border-amber-400 transition opacity-80" onclick="setFilterMode('sun')">
+                <div id="header-sun-icon" class="w-5 h-5 flex items-center justify-center"></div>
+                <div class="flex flex-col">
+                    <span id="sun-coords" class="text-amber-300 font-bold text-[11px] leading-tight">Sun: Az --° | Alt --°</span>
+                    <span class="text-[8px] text-slate-400 font-mono">SOLAR SIGHT LINE</span>
+                </div>
+                <span id="sun-badge" class="text-[9px] px-1.5 py-0.5 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono font-bold">--:--</span>
             </div>
 
             <div class="hidden sm:flex bg-slate-950/90 px-2 py-1 rounded-lg border border-slate-800 items-center gap-1.5">
@@ -620,12 +629,12 @@ HTML_TEMPLATE = r"""
     <!-- GRID PRINCIPAL -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-1.5 flex-grow overflow-hidden">
         
-        <!-- MAPA TÁCTICO CON RANGOS -->
+        <!-- MAPA TÁCTICO CON RANGOS Y ANILLOS -->
         <div class="lg:col-span-3 rounded-xl overflow-hidden border border-slate-800 relative shadow-2xl flex flex-col">
             <div id="map" class="map-container"></div>
             
-            <div class="hidden sm:flex absolute top-2.5 right-2.5 z-[1000] bg-slate-950/90 backdrop-blur p-2 rounded-xl text-[9px] border border-slate-800 flex-col gap-1 shadow-2xl">
-                <span class="font-bold text-slate-400 uppercase text-[8px] mb-0.5">Altitud de Vuelo</span>
+            <div class="hidden sm:flex absolute top-2.5 right-2.5 z-[1000] bg-slate-950/90 backdrop-blur p-2 rounded-xl text-[9px] border border-slate-800/80 flex-col gap-1 shadow-2xl">
+                <span class="font-bold text-slate-400 uppercase text-[8px] mb-0.5 tracking-wider">Flight Level (FL)</span>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#ef4444]"></span> &lt; 3k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#f97316]"></span> 3k - 10k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#eab308]"></span> 10k - 18k ft</div>
@@ -641,17 +650,17 @@ HTML_TEMPLATE = r"""
         </div>
 
         <!-- TELEMETRÍA Y ALERTAS HUD -->
-        <div class="glass-panel rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 shadow-2xl max-h-[42vh] lg:max-h-full">
+        <div class="avionics-panel rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 shadow-2xl max-h-[42vh] lg:max-h-full">
             <div class="flex justify-between items-center border-b border-slate-800 pb-1.5">
                 <h2 class="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                    <span>📡 Sector Traffic</span>
+                    <span>📡 SECTOR TELEMETRY</span>
                     <span id="plane-count" class="bg-cyan-950 text-cyan-300 px-1.5 py-0.2 rounded-full text-[9px] border border-cyan-800 font-mono">0</span>
                 </h2>
                 <span id="filter-indicator" class="text-[9px] text-cyan-400 font-mono font-bold">TARGET: 🌕 MOON</span>
             </div>
             
             <div id="alerts-container" class="flex flex-col gap-1.5 overflow-y-auto">
-                <div class="text-xs text-slate-500 text-center py-8">Tracking sector traffic...</div>
+                <div class="text-xs text-slate-500 text-center py-8">Scanning airspace for transit intercept...</div>
             </div>
         </div>
     </div>
@@ -783,9 +792,9 @@ HTML_TEMPLATE = r"""
         }
 
         const obsCustomIcon = L.divIcon({
-            className: 'obs-container',
+            className: '',
             html: '<div class="obs-target"><div class="obs-ring"></div><div class="obs-dot"></div></div>',
-            iconSize: [32, 32], iconAnchor: [16, 16]
+            iconSize: [34, 34], iconAnchor: [17, 17]
         });
 
         obsMarker = L.marker([observerLat, observerLon], { draggable: false, icon: obsCustomIcon }).addTo(map);
@@ -817,9 +826,9 @@ HTML_TEMPLATE = r"""
                     radius: r,
                     color: '#06b6d4',
                     weight: 1,
-                    dashArray: '3, 6',
+                    dashArray: '3, 7',
                     fill: false,
-                    opacity: 0.18,
+                    opacity: 0.22,
                     interactive: false
                 }).addTo(map);
                 rangeCircles.push(circle);
@@ -1018,27 +1027,87 @@ HTML_TEMPLATE = r"""
             return '#a855f7';
         }
 
-        /* SVG VECTORIAL REALISTA TRANSPARENTE PARA LUNA Y SOL */
-        function getMoonSvgHtml() {
+        /* =========================================================================
+           SVG VECTORIAL ASTRONÓMICO DE LA LUNA (CARA VISIBLE REALISTA)
+           ========================================================================= */
+        function getRealisticMoonSvgHtml(size = 38) {
             return `
-                <div style="position:relative; width:34px; height:34px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 10px rgba(56,189,248,0.85));">
-                    <svg viewBox="0 0 36 36" width="32" height="32" style="overflow:visible;">
-                        <circle cx="18" cy="18" r="16" fill="#f0f9ff" stroke="#38bdf8" stroke-width="1.2"/>
-                        <path d="M11 11 Q14 15 19 13 Q24 11 25 16 Q20 21 15 19 Z" fill="#94a3b8" opacity="0.6"/>
-                        <circle cx="12" cy="23" r="3.2" fill="#94a3b8" opacity="0.55"/>
-                        <circle cx="23" cy="22" r="2.6" fill="#94a3b8" opacity="0.55"/>
-                        <circle cx="20" cy="8" r="1.8" fill="#94a3b8" opacity="0.45"/>
+                <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 10px rgba(56,189,248,0.7));">
+                    <svg viewBox="0 0 100 100" width="${size}" height="${size}" style="overflow:visible;">
+                        <defs>
+                            <radialGradient id="lunarLimbGrad" cx="44%" cy="40%" r="56%">
+                                <stop offset="0%" stop-color="#f8fafc" />
+                                <stop offset="55%" stop-color="#e2e8f0" />
+                                <stop offset="82%" stop-color="#94a3b8" />
+                                <stop offset="100%" stop-color="#475569" />
+                            </radialGradient>
+                            <clipPath id="lunarSphereClip">
+                                <circle cx="50" cy="50" r="46" />
+                            </clipPath>
+                        </defs>
+                        
+                        <!-- Base esférica con oscurecimiento de limbo -->
+                        <circle cx="50" cy="50" r="46" fill="url(#lunarLimbGrad)" stroke="#38bdf8" stroke-width="1.2"/>
+                        
+                        <!-- Topografía real de mares lunares (Basalto oscuro) -->
+                        <g clip-path="url(#lunarSphereClip)">
+                            <!-- Oceanus Procellarum & Mare Imbrium -->
+                            <path d="M 18,36 C 14,48 18,68 30,72 C 38,72 40,62 38,50 C 36,40 28,32 18,36 Z" fill="#334155" opacity="0.68"/>
+                            <circle cx="39" cy="34" r="12" fill="#334155" opacity="0.72"/>
+                            
+                            <!-- Mare Serenitatis -->
+                            <circle cx="59" cy="35" r="8.5" fill="#334155" opacity="0.7"/>
+                            
+                            <!-- Mare Tranquillitatis -->
+                            <ellipse cx="67" cy="48" rx="9" ry="8" fill="#334155" opacity="0.75"/>
+                            
+                            <!-- Mare Crisium (Óvalo aislado característico del este lunar) -->
+                            <ellipse cx="80" cy="38" rx="5.5" ry="4.5" fill="#1e293b" opacity="0.85"/>
+                            
+                            <!-- Mare Fecunditatis & Nectaris -->
+                            <ellipse cx="73" cy="60" rx="8" ry="7" fill="#334155" opacity="0.7"/>
+                            <circle cx="65" cy="63" r="5" fill="#334155" opacity="0.65"/>
+                            
+                            <!-- Mare Nubium & Humorum -->
+                            <ellipse cx="40" cy="64" rx="8" ry="7" fill="#334155" opacity="0.7"/>
+                            <circle cx="27" cy="63" r="4.5" fill="#334155" opacity="0.65"/>
+                            
+                            <!-- Sistema de rayos del cráter Tycho (Polo Sur) -->
+                            <line x1="48" y1="80" x2="30" y2="60" stroke="#ffffff" stroke-width="0.75" opacity="0.65"/>
+                            <line x1="48" y1="80" x2="68" y2="65" stroke="#ffffff" stroke-width="0.75" opacity="0.65"/>
+                            <line x1="48" y1="80" x2="48" y2="40" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
+                            <line x1="48" y1="80" x2="18" y2="82" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
+                            <line x1="48" y1="80" x2="76" y2="82" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
+                            <circle cx="48" cy="80" r="2.4" fill="#ffffff"/>
+                            
+                            <!-- Cráteres icónicos de impacto -->
+                            <circle cx="36" cy="44" r="2.2" fill="#ffffff" opacity="0.95"/> <!-- Copérnico -->
+                            <circle cx="26" cy="45" r="1.6" fill="#ffffff" opacity="0.9"/>  <!-- Kepler -->
+                            <circle cx="24" cy="33" r="1.8" fill="#ffffff" opacity="1.0"/>  <!-- Aristarco (punto más brillante) -->
+                        </g>
                     </svg>
                 </div>
             `;
         }
 
-        function getSunSvgHtml() {
+        /* SVG VECTORIAL DEL SOL CON CORONA Y GRANULACIÓN */
+        function getRealisticSunSvgHtml(size = 38) {
             return `
-                <div style="position:relative; width:34px; height:34px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 12px rgba(245,158,11,0.9));">
-                    <svg viewBox="0 0 36 36" width="32" height="32" style="overflow:visible;">
-                        <circle cx="18" cy="18" r="13" fill="#f59e0b" stroke="#fde047" stroke-width="1.8"/>
-                        <circle cx="18" cy="18" r="16" fill="none" stroke="#fef08a" stroke-width="1.2" stroke-dasharray="3, 3" opacity="0.85"/>
+                <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 12px rgba(245,158,11,0.9));">
+                    <svg viewBox="0 0 100 100" width="${size}" height="${size}" style="overflow:visible;">
+                        <defs>
+                            <radialGradient id="solarDiscGrad" cx="45%" cy="45%" r="55%">
+                                <stop offset="0%" stop-color="#fffbeb" />
+                                <stop offset="60%" stop-color="#fbbf24" />
+                                <stop offset="90%" stop-color="#f59e0b" />
+                                <stop offset="100%" stop-color="#d97706" />
+                            </radialGradient>
+                        </defs>
+                        <circle cx="50" cy="50" r="44" fill="none" stroke="#fef08a" stroke-width="1.5" stroke-dasharray="4, 4" opacity="0.8" />
+                        <circle cx="50" cy="50" r="38" fill="url(#solarDiscGrad)" stroke="#fde047" stroke-width="1.8" />
+                        <!-- Mancha solar / Región activa -->
+                        <ellipse cx="44" cy="42" rx="2" ry="1.5" fill="#78350f" opacity="0.75"/>
+                        <ellipse cx="58" cy="46" rx="2.5" ry="1.8" fill="#78350f" opacity="0.75"/>
                     </svg>
                 </div>
             `;
@@ -1064,7 +1133,7 @@ HTML_TEMPLATE = r"""
                     moonIconMarker.setLatLng(endM);
                 } else {
                     moonIconMarker = L.marker(endM, { 
-                        icon: L.divIcon({ className: '', html: getMoonSvgHtml(), iconSize: [34, 34], iconAnchor: [17, 17] }) 
+                        icon: L.divIcon({ className: '', html: getRealisticMoonSvgHtml(38), iconSize: [38, 38], iconAnchor: [19, 19] }) 
                     }).addTo(map);
                 }
             } else {
@@ -1087,7 +1156,7 @@ HTML_TEMPLATE = r"""
                     sunIconMarker.setLatLng(endS);
                 } else {
                     sunIconMarker = L.marker(endS, { 
-                        icon: L.divIcon({ className: '', html: getSunSvgHtml(), iconSize: [34, 34], iconAnchor: [17, 17] }) 
+                        icon: L.divIcon({ className: '', html: getRealisticSunSvgHtml(38), iconSize: [38, 38], iconAnchor: [19, 19] }) 
                     }).addTo(map);
                 }
             } else {
@@ -1222,24 +1291,31 @@ HTML_TEMPLATE = r"""
             requestAnimationFrame(animateFrame);
         }
 
-        /* DIAGRAMA VECTORIAL DEL DISCO LUNAR/SOLAR EN EL HUD */
+        /* RETÍCULO TÉCNICO DE TELESCOPIO (VISOR DE TRÁNSITO) */
         function renderTransitDiscDiagram(target) {
             const isSun = target.target === 'sun';
             const bodyColor = isSun ? '#fbbf24' : '#38bdf8';
-            const bodyFill = isSun ? '#451a03' : '#082f49';
-            const normOffset = Math.max(-1.8, Math.min(1.8, target.vertical_offset_deg / (target.target === 'sun' ? sunDataGlobal.radius_deg : moonDataGlobal.radius_deg)));
-            const chordY = 22 - (normOffset * 10);
+            const normOffset = Math.max(-1.7, Math.min(1.7, target.vertical_offset_deg / (isSun ? sunDataGlobal.radius_deg : moonDataGlobal.radius_deg)));
+            const chordY = 24 - (normOffset * 11);
 
             return `
-                <div class="flex items-center gap-2 bg-slate-950/80 p-1.5 rounded-lg border border-slate-800/80 mt-1">
-                    <svg width="44" height="44" viewBox="0 0 44 44" class="shrink-0">
-                        <circle cx="22" cy="22" r="16" fill="${bodyFill}" stroke="${bodyColor}" stroke-width="1.5"/>
-                        <line x1="6" y1="22" x2="38" y2="22" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <line x1="4" y1="${chordY.toFixed(1)}" x2="40" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2"/>
+                <div class="flex items-center gap-2.5 bg-slate-950/85 p-2 rounded-lg border border-slate-800/90 mt-1">
+                    <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0">
+                        <circle cx="24" cy="24" r="19" fill="#030712" stroke="${bodyColor}" stroke-width="1.2" stroke-dasharray="3, 2"/>
+                        <circle cx="24" cy="24" r="16" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.5"/>
+                        <!-- Ejes ópticos cartesianos -->
+                        <line x1="5" y1="24" x2="43" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
+                        <line x1="24" y1="5" x2="24" y2="43" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
+                        <!-- Cuerda de tránsito proyectada -->
+                        <line x1="3" y1="${chordY.toFixed(1)}" x2="45" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
                     </svg>
-                    <div class="flex flex-col text-[10px]">
-                        <span class="font-bold ${target.is_transit ? 'text-red-300' : 'text-amber-300'}">${target.position_descriptor}</span>
-                        <span class="text-slate-400">Offset: <b>${target.vertical_offset_deg}°</b> (${target.vertical_body_diams} diam.)</span>
+                    <div class="flex flex-col text-[10px] leading-tight">
+                        <div class="flex items-center gap-1 font-mono">
+                            <span class="text-slate-400 font-bold">CHORD:</span>
+                            <span class="font-bold ${target.is_transit ? 'text-red-300' : 'text-amber-300'}">${target.position_descriptor}</span>
+                        </div>
+                        <span class="text-slate-400 font-mono mt-0.5">Offset: <b class="text-slate-200">${target.vertical_offset_deg > 0 ? '+' : ''}${target.vertical_offset_deg}°</b> (${target.vertical_body_diams} diam.)</span>
+                        <span class="text-slate-400 font-mono">Disk Area: <b class="text-indigo-300">${target.disk_coverage_pct}%</b> (${target.transit_duration_s}s dur.)</span>
                     </div>
                 </div>
             `;
@@ -1248,7 +1324,7 @@ HTML_TEMPLATE = r"""
         function updateHUDCountdowns() {
             const container = document.getElementById('alerts-container');
             if (!activeAircraftData || activeAircraftData.length === 0) {
-                container.innerHTML = '<div class="text-xs text-slate-500 text-center py-8">Tracking sector traffic...</div>';
+                container.innerHTML = '<div class="text-xs text-slate-500 text-center py-8">Scanning airspace for transit intercept...</div>';
                 clearTcaTrajectory();
                 return;
             }
@@ -1280,12 +1356,12 @@ HTML_TEMPLATE = r"""
                 const secs = (remaining % 60).toFixed(1).padStart(4, '0');
                 const timerStr = remaining > 0 ? `T-${mins.toString().padStart(2, '0')}:${secs}` : `TRANSITING!`;
 
-                let cardBorder = 'border-slate-800 bg-slate-950/60';
-                let tagHtml = `<span class="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[8px] font-bold">${sym} EN ROUTE</span>`;
+                let cardBorder = 'border-slate-800/80 bg-slate-950/60';
+                let tagHtml = `<span class="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono">${sym} EN ROUTE</span>`;
 
                 if (isTransit) {
-                    cardBorder = 'border-red-500 bg-red-950/70 shadow-lg shadow-red-950/50';
-                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[9px] font-black animate-pulse">🎯 ${sym} TRANSIT (${target.transit_duration_s}s)!</span>`;
+                    cardBorder = 'border-red-500/90 bg-red-950/60 glow-red';
+                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[9px] font-black font-mono animate-pulse">🎯 ${sym} TRANSIT LOCK</span>`;
                     
                     if (!priorityTransitFound && remaining > 0) {
                         priorityTransitFound = true;
@@ -1333,8 +1409,8 @@ HTML_TEMPLATE = r"""
                         lastBeepedFlight = flightKey;
                     }
                 } else if (isClose) {
-                    cardBorder = 'border-amber-500 bg-amber-950/60';
-                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold">⚠️ ${sym} CLOSE PASS</span>`;
+                    cardBorder = 'border-amber-500/80 bg-amber-950/50 glow-amber';
+                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono">⚠️ ${sym} CLOSE PASS</span>`;
                     if (!priorityTransitFound && remaining > 0 && remaining < 180) {
                         priorityTransitFound = true;
                         renderTcaTrajectory(plane, target);
@@ -1344,21 +1420,26 @@ HTML_TEMPLATE = r"""
                 html += `
                     <div onclick="focusPlane('${plane.callsign}')" 
                          class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1 transition cursor-pointer hud-card">
-                        <div class="flex justify-between items-center">
-                            <div class="flex items-center gap-1.5">
-                                <span class="font-black text-sm ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
-                                <span class="px-1.5 py-0.2 bg-slate-800 text-cyan-300 border border-slate-700 rounded text-[9px] font-bold font-mono">${plane.model}</span>
-                                <span class="text-[8px] px-1 bg-slate-900 text-slate-400 border border-slate-700 rounded font-mono">${plane.alt_type}</span>
+                        
+                        <!-- Header de la tira de vuelo -->
+                        <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5">
+                            <div class="flex items-center gap-1.5 font-mono">
+                                <span class="font-black text-sm tracking-wide ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
+                                <span class="px-1.5 py-0.2 bg-slate-900 text-cyan-300 border border-slate-700 rounded text-[9px] font-bold">${plane.model}</span>
+                                <span class="text-[8px] px-1 bg-slate-900 text-slate-400 border border-slate-700 rounded">${plane.alt_type}</span>
                             </div>
                             ${tagHtml}
                         </div>
                         
-                        <div class="grid grid-cols-2 gap-1 text-[10.5px] text-slate-300">
-                            <span>Alt: <b>${plane.alt_ft.toLocaleString()} ft</b></span>
-                            <span>V/S: <b>${plane.vr_fpm} ft/m</b></span>
-                            <span>Dist: <b>${plane.distance_km} km</b></span>
-                            <span>TCA: <b class="${isTransit ? 'text-red-400 font-black' : (isClose ? 'text-amber-300' : 'text-cyan-300')} font-mono">${timerStr}</b></span>
-                            <span class="col-span-2">Angular Size: <b class="text-indigo-300 font-mono">${target.angular_size_arcsec}" (${target.disk_coverage_pct}% disk)</b></span>
+                        <!-- Telemetría en formato avionics grid -->
+                        <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] font-mono text-slate-300 mt-0.5">
+                            <div><span class="text-slate-500">ALT:</span> <b>${plane.alt_ft.toLocaleString()} ft</b></div>
+                            <div><span class="text-slate-500">V/S:</span> <b>${plane.vr_fpm > 0 ? '+' : ''}${plane.vr_fpm} ft/m</b></div>
+                            <div><span class="text-slate-500">SPD:</span> <b>${plane.speed_kt} kt</b></div>
+                            <div><span class="text-slate-500">RNG:</span> <b>${plane.distance_km} km</b></div>
+                            <div><span class="text-slate-500">HDG:</span> <b>${plane.track}°</b></div>
+                            <div><span class="text-slate-500">TCA:</span> <b class="${isTransit ? 'text-red-400 font-black' : (isClose ? 'text-amber-300 font-bold' : 'text-cyan-300')}">${timerStr}</b></div>
+                            <div class="col-span-2"><span class="text-slate-500">SPAN / SIZE:</span> <b class="text-indigo-300">${plane.wingspan_m}m &bull; ${target.angular_size_arcsec}"</b></div>
                         </div>
 
                         ${(isTransit || isClose) ? renderTransitDiscDiagram(target) : ''}
@@ -1393,7 +1474,7 @@ HTML_TEMPLATE = r"""
                 tcaMarker.setLatLng(tcaPos);
             } else {
                 tcaMarker = L.marker(tcaPos, {
-                    icon: L.divIcon({ className: '', html: tcaHtml, iconSize: [26, 26], iconAnchor: [13, 13] })
+                    icon: L.divIcon({ className: '', html: tcaHtml, iconSize: [28, 28], iconAnchor: [14, 14] })
                 }).addTo(map);
             }
         }
@@ -1415,6 +1496,10 @@ HTML_TEMPLATE = r"""
         document.getElementById('building-offset').value = buildingOffsetM.toString();
         document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
 
+        // Cargar mini-iconos vectoriales en la barra superior
+        document.getElementById('header-moon-icon').innerHTML = getRealisticMoonSvgHtml(20);
+        document.getElementById('header-sun-icon').innerHTML = getRealisticSunSvgHtml(20);
+
         drawRangeRings();
         fetchData();
         fetchTerrainElevation(observerLat, observerLon);
@@ -1429,9 +1514,10 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO - BY MARC GARRIDO")
-    print(f" [OK] Transparent Vector Graphics & Transit Chord Visualizer: LOADED")
-    print(f" [OK] Leaflet DivIcon Style Override: ACTIVE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO - TACTICAL AVIONICS ENGINE")
+    print(f" [OK] Realistic Lunar Surface & Vector Corona: LOADED")
+    print(f" [OK] Tropospheric Refraction & Latency Siphon: ACTIVE")
+    print(f" [OK] CARTO Basemap & Audio Engine: ONLINE")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
