@@ -273,7 +273,7 @@ def get_data():
             except (ValueError, TypeError):
                 continue
 
-            # Compensación cinemática limpia y segura contra el lag de Flightradar24
+            # Extrapolación de latencia calibrable
             seen_pos = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
             seen_pos = max(0.0, min(15.0, seen_pos))
             total_lead = seen_pos + user_lead_sec
@@ -533,64 +533,131 @@ HTML_TEMPLATE = r"""
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #030712; color: #f1f5f9; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        body { 
+            background-color: #020617; 
+            color: #f8fafc; 
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-feature-settings: "tnum" 1;
+        }
+        
         .map-container { height: calc(100dvh - 114px); width: 100%; border-radius: 12px; }
-        .leaflet-container { background: #030712 !important; }
+        .leaflet-container { background: #020617 !important; }
         
         .leaflet-div-icon {
             background: transparent !important;
             border: none !important;
         }
 
-        .obs-target { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; }
-        .obs-ring { position: absolute; width: 34px; height: 34px; border-radius: 50%; background: rgba(6, 182, 212, 0.18); border: 2px solid #06b6d4; animation: pulse-ring 2.2s infinite ease-out; }
-        .obs-dot { width: 10px; height: 10px; border-radius: 50%; background: #22d3ee; border: 2px solid #ffffff; box-shadow: 0 0 14px #06b6d4; z-index: 10; }
-        @keyframes pulse-ring { 0% { transform: scale(0.5); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
+        /* Marcador táctico del observador con haz de barrido GPU */
+        .obs-target { 
+            position: relative;
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            width: 44px; 
+            height: 44px; 
+            pointer-events: none;
+        }
+        .obs-sweep {
+            position: absolute;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: conic-gradient(from 0deg, rgba(6, 182, 212, 0.4) 0deg, transparent 60deg, transparent 360deg);
+            animation: radar-sweep 3s linear infinite;
+            will-change: transform;
+        }
+        .obs-ring { 
+            position: absolute; 
+            width: 32px; 
+            height: 32px; 
+            border-radius: 50%; 
+            background: rgba(6, 182, 212, 0.15); 
+            border: 1.5px solid #06b6d4; 
+            animation: pulse-ring 2.2s infinite ease-out; 
+        }
+        .obs-dot { 
+            width: 8px; 
+            height: 8px; 
+            border-radius: 50%; 
+            background: #22d3ee; 
+            border: 2px solid #ffffff; 
+            box-shadow: 0 0 12px #06b6d4; 
+            z-index: 10; 
+        }
+        @keyframes pulse-ring { 0% { transform: scale(0.6); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
+        @keyframes radar-sweep { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
+        /* Retículo de intercepción en mapa */
         .tca-target { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; }
-        .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; }
+        .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; will-change: transform; }
         .tca-crosshair-h { position: absolute; width: 28px; height: 1.5px; background: rgba(239, 68, 68, 0.8); }
         .tca-crosshair-v { position: absolute; width: 1.5px; height: 28px; background: rgba(239, 68, 68, 0.8); }
         .tca-core { width: 6px; height: 6px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 12px #ef4444; z-index: 10; }
         @keyframes tca-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
+        /* Paneles tácticos con efecto HUD de aviónica militar */
         .avionics-panel { 
-            background: linear-gradient(180deg, rgba(15, 23, 42, 0.94) 0%, rgba(6, 11, 25, 0.98) 100%);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(51, 65, 85, 0.65);
+            background: linear-gradient(180deg, rgba(15, 23, 42, 0.95) 0%, rgba(3, 7, 18, 0.98) 100%);
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(51, 65, 85, 0.7);
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7);
         }
 
+        /* Tarjeta POD con muescas angulares en las esquinas */
         .hud-card { 
             position: relative;
-            background: rgba(10, 16, 31, 0.82);
-            border: 1px solid rgba(30, 41, 59, 0.85);
+            background: rgba(11, 19, 38, 0.85);
+            border: 1px solid rgba(30, 41, 59, 0.9);
             backdrop-filter: blur(8px);
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            contain: layout style;
+        }
+        .hud-card::before {
+            content: '';
+            position: absolute;
+            top: -1px; left: -1px;
+            width: 6px; height: 6px;
+            border-top: 2px solid #06b6d4;
+            border-left: 2px solid #06b6d4;
+            pointer-events: none;
+        }
+        .hud-card::after {
+            content: '';
+            position: absolute;
+            bottom: -1px; right: -1px;
+            width: 6px; height: 6px;
+            border-bottom: 2px solid #06b6d4;
+            border-right: 2px solid #06b6d4;
+            pointer-events: none;
         }
         .hud-card:hover { 
             transform: translateY(-1px); 
-            border-color: rgba(6, 182, 212, 0.7);
-            box-shadow: 0 0 18px rgba(6, 182, 212, 0.15);
+            border-color: rgba(6, 182, 212, 0.75);
+            box-shadow: 0 0 20px rgba(6, 182, 212, 0.2);
         }
 
-        .glow-cyan { box-shadow: 0 0 16px rgba(6, 182, 212, 0.35); }
-        .glow-amber { box-shadow: 0 0 16px rgba(245, 158, 11, 0.35); }
+        .glow-cyan { box-shadow: 0 0 18px rgba(6, 182, 212, 0.4); }
+        .glow-amber { box-shadow: 0 0 18px rgba(245, 158, 11, 0.4); }
+        .glow-red { box-shadow: 0 0 24px rgba(239, 68, 68, 0.45); }
 
         .terminal-screen {
-            background-color: #020617;
-            background-image: radial-gradient(rgba(16, 185, 129, 0.1) 1px, transparent 0);
-            background-size: 24px 24px;
+            background-color: #010409;
+            background-image: radial-gradient(rgba(16, 185, 129, 0.12) 1px, transparent 0);
+            background-size: 20px 20px;
         }
 
         ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: #030712; }
+        ::-webkit-scrollbar-track { background: #020617; }
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
     </style>
 </head>
 <body class="p-1.5 md:p-2 flex flex-col h-[100dvh] overflow-hidden select-none">
     
-    <!-- BARRA SUPERIOR DE CABINA -->
+    <!-- CABINA SUPERIOR: TELEMETRÍA Y CONTROLES -->
     <header class="avionics-panel px-3 py-1.5 rounded-xl mb-1.5 flex flex-wrap justify-between items-center gap-2 shadow-2xl">
+        
+        <!-- LOGO Y STATUS ENGINE -->
         <div class="flex items-center gap-2">
             <span class="text-2xl animate-pulse">🌔</span>
             <div>
@@ -602,29 +669,29 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
         
-        <!-- ESTADO DE CUERPOS CELESTES RECUPERADOS CON GLOW Y COORDENADAS -->
+        <!-- TARJETAS DE CUERPOS CELESTES RECUPERADAS CON GLOW DINÁMICO -->
         <div class="flex items-center gap-1.5 text-xs">
             <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer hover:border-cyan-400 transition glow-cyan ring-1 ring-cyan-400/50" onclick="setFilterMode('moon')">
                 <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
                 <div class="flex flex-col">
-                    <span id="moon-coords" class="text-cyan-300 font-bold text-[11px] leading-tight">Moon: Az --° | Alt --°</span>
-                    <span class="text-[8px] text-slate-400 font-mono">OPTICAL VECTOR LOCK</span>
+                    <span id="moon-coords" class="text-cyan-300 font-bold text-[11px] leading-tight tabular-nums">Moon: Az --° | Alt --°</span>
+                    <span class="text-[8px] text-slate-400 font-mono tracking-wider">OPTICAL VECTOR LOCK</span>
                 </div>
-                <span id="moon-badge" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 text-cyan-400 rounded border border-cyan-800 font-mono font-bold">--:--</span>
+                <span id="moon-badge" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 text-cyan-400 rounded border border-cyan-800 font-mono font-bold tabular-nums">--:--</span>
             </div>
 
             <div id="sun-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-amber-400 transition" onclick="setFilterMode('sun')">
                 <div id="header-sun-icon" class="w-5 h-5 flex items-center justify-center"></div>
                 <div class="flex flex-col">
-                    <span id="sun-coords" class="text-amber-300 font-bold text-[11px] leading-tight">Sun: Az --° | Alt --°</span>
-                    <span class="text-[8px] text-slate-400 font-mono">SOLAR SIGHT LINE</span>
+                    <span id="sun-coords" class="text-amber-300 font-bold text-[11px] leading-tight tabular-nums">Sun: Az --° | Alt --°</span>
+                    <span class="text-[8px] text-slate-400 font-mono tracking-wider">SOLAR SIGHT LINE</span>
                 </div>
-                <span id="sun-badge" class="text-[9px] px-1.5 py-0.5 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono font-bold">--:--</span>
+                <span id="sun-badge" class="text-[9px] px-1.5 py-0.5 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono font-bold tabular-nums">--:--</span>
             </div>
 
             <div class="hidden sm:flex bg-slate-950/90 px-2 py-1 rounded-lg border border-slate-800 items-center gap-1.5">
-                <span id="obs-coords" class="text-cyan-400 font-bold text-[11px]">41.6079, 2.2876</span>
-                <span id="obs-alt-badge" class="text-emerald-300 font-bold text-[11px]">⛰️ 145m</span>
+                <span id="obs-coords" class="text-cyan-400 font-bold text-[11px] tabular-nums">41.6079, 2.2876</span>
+                <span id="obs-alt-badge" class="text-emerald-300 font-bold text-[11px] tabular-nums">⛰️ 145m</span>
                 <button id="lock-btn" onclick="toggleLocationLock()" class="text-[10px] px-1 bg-slate-900 hover:bg-slate-800 text-slate-300 rounded border border-slate-700 font-bold transition">
                     🔒
                 </button>
@@ -633,10 +700,10 @@ HTML_TEMPLATE = r"""
 
         <!-- CONTROL DE SINCRONIZACIÓN DE LATENCIA (LEAD SYNC) -->
         <div class="flex items-center gap-1 bg-slate-950 px-2 py-1 rounded-lg border border-slate-800">
-            <span class="text-[10px] text-slate-400 font-bold">⚡ LEAD:</span>
-            <button onclick="adjustLead(-0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">-</button>
-            <span id="lead-display" class="font-mono text-xs font-black text-amber-400 min-w-[46px] text-center">+6.0s</span>
-            <button onclick="adjustLead(0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">+</button>
+            <span class="text-[9px] text-slate-400 font-bold tracking-wider">⚡ LEAD:</span>
+            <button onclick="adjustLead(-0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs transition active:scale-95">-</button>
+            <span id="lead-display" class="font-mono text-xs font-black text-amber-400 min-w-[46px] text-center tabular-nums">+6.0s</span>
+            <button onclick="adjustLead(0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs transition active:scale-95">+</button>
         </div>
 
         <!-- SELECTOR DE FILTROS MOON / SUN / DUAL -->
@@ -648,16 +715,16 @@ HTML_TEMPLATE = r"""
 
         <!-- CONMUTADOR: MAPA TÁCTICO VS TERMINAL HARVARD -->
         <div class="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
-            <button id="view-map-btn" onclick="setViewMode('map')" class="text-[10px] px-2 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">
+            <button id="view-map-btn" onclick="setViewMode('map')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">
                 🗺️ Map
             </button>
-            <button id="view-terminal-btn" onclick="setViewMode('terminal')" class="text-[10px] px-2 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1">
+            <button id="view-terminal-btn" onclick="setViewMode('terminal')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1">
                 <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
                 💻 Terminal
             </button>
         </div>
 
-        <!-- HERRAMIENTAS Y UBICACIÓN -->
+        <!-- HERRAMIENTAS RÁPIDAS -->
         <div class="flex items-center gap-1">
             <button id="voice-btn" onclick="toggleVoice()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">🗣️</button>
             <button id="audio-btn" onclick="toggleAudio()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">🔇</button>
@@ -689,7 +756,7 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- VISTA 2: HARVARD ASTRO-TERMINAL (CONSOLA HACKER DESACOPLADA) -->
+        <!-- VISTA 2: HARVARD ASTRO-TERMINAL -->
         <div id="terminal-viewport" class="lg:col-span-3 rounded-xl overflow-hidden border border-emerald-900/60 relative shadow-2xl flex flex-col hidden terminal-screen">
             <div class="bg-slate-950 px-3 py-2 border-b border-emerald-900/50 flex justify-between items-center text-xs">
                 <div class="flex items-center gap-2">
@@ -709,21 +776,21 @@ HTML_TEMPLATE = r"""
 
             <div class="bg-slate-950/90 border-t border-emerald-900/40 p-2 flex justify-between items-center text-[10px] text-slate-400 font-mono">
                 <span>MATRICES: WGS84 ECEF &bull; ENU &bull; GSS RES: &plusmn;3ms</span>
-                <span id="terminal-clock" class="text-emerald-400 font-bold">2026-09-25 00:00:00 UTC</span>
+                <span id="terminal-clock" class="text-emerald-400 font-bold tabular-nums">2026-09-25 00:00:00 UTC</span>
             </div>
         </div>
 
-        <!-- TELEMETRÍA LATERAL HUD -->
+        <!-- TELEMETRÍA LATERAL HUD (TARJETAS POD MODULARES) -->
         <div class="avionics-panel rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 shadow-2xl max-h-[42vh] lg:max-h-full">
             <div class="flex justify-between items-center border-b border-slate-800 pb-1.5">
                 <h2 class="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
                     <span>📡 SECTOR TELEMETRY</span>
-                    <span id="plane-count" class="bg-cyan-950 text-cyan-300 px-1.5 py-0.2 rounded-full text-[9px] border border-cyan-800 font-mono">0</span>
+                    <span id="plane-count" class="bg-cyan-950 text-cyan-300 px-1.5 py-0.2 rounded-full text-[9px] border border-cyan-800 font-mono tabular-nums">0</span>
                 </h2>
-                <span id="filter-indicator" class="text-[9px] text-cyan-400 font-mono font-bold">TARGET: 🌕 MOON</span>
+                <span id="filter-indicator" class="text-[9px] text-cyan-400 font-mono font-bold tracking-wider">TARGET: 🌕 MOON</span>
             </div>
             
-            <div id="alerts-container" class="flex flex-col gap-1.5 overflow-y-auto">
+            <div id="alerts-container" class="flex flex-col gap-2 overflow-y-auto">
                 <div class="text-xs text-slate-500 text-center py-8">Scanning airspace for transit intercept...</div>
             </div>
         </div>
@@ -740,16 +807,16 @@ HTML_TEMPLATE = r"""
             <div class="flex flex-col gap-1">
                 <label class="text-xs text-slate-300 font-bold">🏢 Observer / Rooftop Elevation Offset</label>
                 <div class="flex items-center gap-2">
-                    <input id="building-offset" type="number" value="0" min="0" max="500" onchange="updateBuildingOffset(this.value)" class="w-full bg-slate-950 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold">
-                    <span class="text-slate-400 text-xs">m</span>
+                    <input id="building-offset" type="number" value="0" min="0" max="500" onchange="updateBuildingOffset(this.value)" class="w-full bg-slate-950 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold tabular-nums">
+                    <span class="text-slate-400 text-xs font-bold">m</span>
                 </div>
             </div>
 
             <div class="flex justify-between items-center pt-2 border-t border-slate-800">
-                <button onclick="toggleMapLayer()" id="layer-btn" class="bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 font-bold">
+                <button onclick="toggleMapLayer()" id="layer-btn" class="bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 font-bold transition">
                     🗺️ Toggle Sat Map
                 </button>
-                <button onclick="toggleSettingsModal()" class="bg-cyan-600 hover:bg-cyan-500 text-xs text-white px-4 py-1.5 rounded-lg font-bold">
+                <button onclick="toggleSettingsModal()" class="bg-cyan-600 hover:bg-cyan-500 text-xs text-white px-4 py-1.5 rounded-lg font-bold transition">
                     Guardar
                 </button>
             </div>
@@ -821,8 +888,8 @@ HTML_TEMPLATE = r"""
 
         const obsCustomIcon = L.divIcon({
             className: '',
-            html: '<div class="obs-target"><div class="obs-ring"></div><div class="obs-dot"></div></div>',
-            iconSize: [34, 34], iconAnchor: [17, 17]
+            html: '<div class="obs-target"><div class="obs-sweep"></div><div class="obs-ring"></div><div class="obs-dot"></div></div>',
+            iconSize: [44, 44], iconAnchor: [22, 22]
         });
 
         obsMarker = L.marker([observerLat, observerLon], { draggable: false, icon: obsCustomIcon }).addTo(map);
@@ -855,14 +922,14 @@ HTML_TEMPLATE = r"""
             if (mode === 'map') {
                 mapV.classList.remove('hidden');
                 termV.classList.add('hidden');
-                mapB.className = "text-[10px] px-2 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800";
-                termB.className = "text-[10px] px-2 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1";
+                mapB.className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_10px_rgba(6,182,212,0.3)]";
+                termB.className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1";
                 map.invalidateSize();
             } else {
                 mapV.classList.add('hidden');
                 termV.classList.remove('hidden');
-                termB.className = "text-[10px] px-2 py-1 rounded font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-1";
-                mapB.className = "text-[10px] px-2 py-1 rounded font-bold text-slate-400 hover:text-cyan-300";
+                termB.className = "text-[10px] px-2.5 py-1 rounded font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-1 shadow-[0_0_10px_rgba(16,185,129,0.3)]";
+                mapB.className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-cyan-300";
             }
         }
 
@@ -871,7 +938,7 @@ HTML_TEMPLATE = r"""
             const btn = document.getElementById('term-pause-btn');
             btn.innerText = terminalPaused ? "▶ Resume" : "⏸ Pause";
             btn.className = terminalPaused 
-                ? "px-2 py-0.5 bg-amber-950 text-amber-300 border border-amber-800 rounded text-[10px]"
+                ? "px-2 py-0.5 bg-amber-950 text-amber-300 border border-amber-800 rounded text-[10px] font-bold"
                 : "px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]";
         }
 
@@ -889,7 +956,7 @@ HTML_TEMPLATE = r"""
             rangeCircles = [];
             [15000, 30000, 50000].forEach((r) => {
                 const circle = L.circle([observerLat, observerLon], {
-                    radius: r, color: '#06b6d4', weight: 1, dashArray: '3, 7', fill: false, opacity: 0.22, interactive: false
+                    radius: r, color: '#06b6d4', weight: 1, dashArray: '4, 8', fill: false, opacity: 0.22, interactive: false
                 }).addTo(map);
                 rangeCircles.push(circle);
             });
@@ -912,7 +979,7 @@ HTML_TEMPLATE = r"""
             const footerInfo = document.getElementById('footer-astro-info');
 
             if (mode === 'moon') {
-                document.getElementById('btn-flt-moon').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_10px_rgba(6,182,212,0.4)]";
+                document.getElementById('btn-flt-moon').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_12px_rgba(6,182,212,0.4)]";
                 document.getElementById('filter-indicator').innerText = "TARGET: 🌕 MOON";
                 if (moonCard) {
                     moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer transition glow-cyan ring-1 ring-cyan-400/50";
@@ -923,7 +990,7 @@ HTML_TEMPLATE = r"""
                 footerInd.innerHTML = `<span class="text-cyan-400 font-bold">🌕──────</span>`;
                 footerInfo.innerText = "Optical Sight Line to the Moon";
             } else if (mode === 'sun') {
-                document.getElementById('btn-flt-sun').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-amber-950 text-amber-300 border border-amber-800 shadow-[0_0_10px_rgba(245,158,11,0.4)]";
+                document.getElementById('btn-flt-sun').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-amber-950 text-amber-300 border border-amber-800 shadow-[0_0_12px_rgba(245,158,11,0.4)]";
                 document.getElementById('filter-indicator').innerText = "TARGET: ☀️ SUN";
                 if (sunCard) {
                     sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-500 flex items-center gap-2 cursor-pointer transition glow-amber ring-1 ring-amber-400/50";
@@ -952,7 +1019,7 @@ HTML_TEMPLATE = r"""
         function toggleVoice() {
             voiceEnabled = !voiceEnabled;
             const btn = document.getElementById('voice-btn');
-            btn.className = voiceEnabled ? "bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold" : "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
+            btn.className = voiceEnabled ? "bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold shadow-[0_0_10px_rgba(168,85,247,0.4)]" : "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
             if (voiceEnabled) speak("Vocal radar active");
         }
 
@@ -970,7 +1037,7 @@ HTML_TEMPLATE = r"""
             if (audioEnabled) {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 if (audioContext.state === 'suspended') audioContext.resume();
-                btn.innerText = "🔔"; btn.className = "bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold";
+                btn.innerText = "🔔"; btn.className = "bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold shadow-[0_0_10px_rgba(16,185,129,0.4)]";
                 playChime();
             } else {
                 btn.innerText = "🔇"; btn.className = "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
@@ -1197,7 +1264,7 @@ HTML_TEMPLATE = r"""
                     document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
                 }
 
-                // Actualización de coordenadas celestes y badges
+                // Actualización de coordenadas celestes y badges con tabulación numérica
                 const mCoords = document.getElementById('moon-coords');
                 const mBadge = document.getElementById('moon-badge');
                 if (mCoords) mCoords.innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
@@ -1210,25 +1277,26 @@ HTML_TEMPLATE = r"""
 
                 renderAstroVectors();
 
+                // Telemetría del terminal Harvard
                 if (!terminalPaused) {
                     const term = document.getElementById('terminal-output');
                     const nowStr = new Date().toISOString().replace('T', ' ').slice(11, 23);
                     
                     const logEntry = document.createElement('div');
-                    logEntry.innerHTML = `[${nowStr}Z] <span class="text-cyan-400">RADAR_KERNEL:</span> OBS=[${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}] | TARGETS=${data.aircraft ? data.aircraft.length : 0} | FEED=${data.source_feed} | LEAD=+${userLeadSec}s`;
+                    logEntry.innerHTML = `[${nowStr}Z] <span class="text-cyan-400 font-bold">RADAR_KERNEL:</span> OBS=[${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}] | TARGETS=${data.aircraft ? data.aircraft.length : 0} | FEED=${data.source_feed} | LEAD=+${userLeadSec}s`;
                     term.appendChild(logEntry);
 
                     if (data.aircraft) {
                         data.aircraft.slice(0, 3).forEach(p => {
                             const target = p.primary;
                             const subEntry = document.createElement('div');
-                            subEntry.className = "text-[10px] pl-4 text-emerald-400/80";
+                            subEntry.className = "text-[10px] pl-4 text-emerald-400/80 font-mono";
                             subEntry.innerHTML = `&bull; TGT:<b>${p.callsign}</b> (${p.model}) | FL${Math.round(p.alt_ft/100)} | DIST:${p.distance_km}km | SEP:${target.min_sep}° | TCA:${target.tca_seconds}s | CHORD:${target.position_descriptor}`;
                             term.appendChild(subEntry);
                         });
                     }
 
-                    while (term.children.length > 200) term.removeChild(term.firstChild);
+                    while (term.children.length > 150) term.removeChild(term.firstChild);
                     term.scrollTop = term.scrollHeight;
                     document.getElementById('terminal-clock').innerText = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
                 }
@@ -1318,6 +1386,7 @@ HTML_TEMPLATE = r"""
             } catch (err) {}
         }
 
+        // Animación suave Dead Reckoning a 60 FPS acelerada por hardware
         let lastAnimTime = performance.now();
         function animateFrame(nowMs) {
             const dt = Math.min(0.08, Math.max(0.001, (nowMs - lastAnimTime) / 1000.0));
@@ -1334,6 +1403,7 @@ HTML_TEMPLATE = r"""
             requestAnimationFrame(animateFrame);
         }
 
+        /* RETÍCULO ÓPTICO TÉCNICO DE TELESCOPIO CON GRADUACIONES CARDINALES */
         function renderTransitDiscDiagram(target) {
             const isSun = target.target === 'sun';
             const bodyColor = isSun ? '#fbbf24' : '#38bdf8';
@@ -1342,30 +1412,39 @@ HTML_TEMPLATE = r"""
             const chordY = 24 - (normOffset * 11);
 
             return `
-                <div class="flex items-center gap-2.5 bg-slate-950/85 p-2 rounded-lg border border-slate-800/90 mt-1">
-                    <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0">
-                        <circle cx="24" cy="24" r="19" fill="#030712" stroke="${bodyColor}" stroke-width="1.2" stroke-dasharray="3, 2"/>
-                        <circle cx="24" cy="24" r="16" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.5"/>
-                        <line x1="5" y1="24" x2="43" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <line x1="24" y1="5" x2="24" y2="43" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <line x1="3" y1="${chordY.toFixed(1)}" x2="45" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
+                <div class="flex items-center gap-2.5 bg-slate-950/90 p-2 rounded-lg border border-slate-800/90 mt-1 shadow-inner">
+                    <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0 select-none">
+                        <!-- Círculos de escala exterior -->
+                        <circle cx="24" cy="24" r="22" fill="none" stroke="#1e293b" stroke-width="1"/>
+                        <circle cx="24" cy="24" r="18" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.4"/>
+                        <!-- Ejes ópticos cartesianos con graduaciones cardinales -->
+                        <line x1="4" y1="24" x2="44" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
+                        <line x1="24" y1="4" x2="24" y2="44" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
+                        <!-- Ticks cardinales -->
+                        <line x1="24" y1="2" x2="24" y2="6" stroke="${bodyColor}" stroke-width="1.2"/>
+                        <line x1="24" y1="42" x2="24" y2="46" stroke="${bodyColor}" stroke-width="1.2"/>
+                        <line x1="2" y1="24" x2="6" y2="24" stroke="${bodyColor}" stroke-width="1.2"/>
+                        <line x1="42" y1="24" x2="46" y2="24" stroke="${bodyColor}" stroke-width="1.2"/>
+                        <!-- Cuerda de tránsito con corte visible -->
+                        <line x1="2" y1="${chordY.toFixed(1)}" x2="46" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
                     </svg>
-                    <div class="flex flex-col text-[10px] leading-tight">
-                        <div class="flex items-center gap-1 font-mono">
-                            <span class="text-slate-400 font-bold">CHORD:</span>
-                            <span class="font-bold ${target.is_transit ? 'text-red-300' : 'text-amber-300'}">${target.position_descriptor}</span>
+                    <div class="flex flex-col text-[10px] leading-tight font-mono">
+                        <div class="flex items-center gap-1">
+                            <span class="text-slate-500 uppercase font-bold tracking-wider text-[8px]">CHORD:</span>
+                            <span class="font-bold ${target.is_transit ? 'text-red-400' : 'text-amber-400'}">${target.position_descriptor}</span>
                         </div>
-                        <span class="text-slate-400 font-mono mt-0.5">Offset: <b class="text-slate-200">${target.vertical_offset_deg > 0 ? '+' : ''}${target.vertical_offset_deg}°</b> (${target.vertical_body_diams} diam.)</span>
-                        <span class="text-slate-400 font-mono">Disk Area: <b class="text-indigo-300">${target.disk_coverage_pct}%</b> (${target.transit_duration_s}s dur.)</span>
+                        <span class="text-slate-400 mt-0.5">Offset: <b class="text-slate-200 tabular-nums">${target.vertical_offset_deg > 0 ? '+' : ''}${target.vertical_offset_deg}°</b> (${target.vertical_body_diams} diam.)</span>
+                        <span class="text-slate-400">Coverage: <b class="text-indigo-300 tabular-nums">${target.disk_coverage_pct}%</b> (${target.transit_duration_s}s dur.)</span>
                     </div>
                 </div>
             `;
         }
 
+        /* HUD TELEMETRY CARDS MODULARES (POD LAYOUT PROFESIONAL) */
         function updateHUDCountdowns() {
             const container = document.getElementById('alerts-container');
             if (!activeAircraftData || activeAircraftData.length === 0) {
-                container.innerHTML = '<div class="text-xs text-slate-500 text-center py-8">Scanning airspace for transit intercept...</div>';
+                container.innerHTML = '<div class="text-xs text-slate-500 text-center py-8 font-mono">Scanning airspace for transit intercept...</div>';
                 clearTcaTrajectory();
                 return;
             }
@@ -1398,11 +1477,11 @@ HTML_TEMPLATE = r"""
                 const timerStr = remaining > 0 ? `T-${mins.toString().padStart(2, '0')}:${secs}` : `TRANSITING!`;
 
                 let cardBorder = 'border-slate-800/80 bg-slate-950/60';
-                let tagHtml = `<span class="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono">${sym} EN ROUTE</span>`;
+                let tagHtml = `<span class="bg-slate-900 text-slate-400 border border-slate-800 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">${sym} EN ROUTE</span>`;
 
                 if (isTransit) {
-                    cardBorder = 'border-red-500/90 bg-red-950/60';
-                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[9px] font-black font-mono animate-pulse">🎯 ${sym} TRANSIT LOCK</span>`;
+                    cardBorder = 'border-red-500/90 bg-red-950/60 glow-red';
+                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[8px] font-black font-mono tracking-wider animate-pulse">🎯 ${sym} TRANSIT LOCK</span>`;
                     
                     if (!priorityTransitFound && remaining > 0) {
                         priorityTransitFound = true;
@@ -1441,8 +1520,8 @@ HTML_TEMPLATE = r"""
                         lastBeepedFlight = flightKey;
                     }
                 } else if (isClose) {
-                    cardBorder = 'border-amber-500/80 bg-amber-950/50';
-                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono">⚠️ ${sym} CLOSE PASS</span>`;
+                    cardBorder = 'border-amber-500/80 bg-amber-950/50 glow-amber';
+                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">⚠️ ${sym} CLOSE PASS</span>`;
                     if (!priorityTransitFound && remaining > 0 && remaining < 180) {
                         priorityTransitFound = true;
                         renderTcaTrajectory(plane, target);
@@ -1451,25 +1530,37 @@ HTML_TEMPLATE = r"""
 
                 html += `
                     <div onclick="focusPlane('${plane.callsign}')" 
-                         class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1 transition cursor-pointer hud-card">
+                         class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1.5 transition cursor-pointer hud-card">
                         
-                        <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5">
-                            <div class="flex items-center gap-1.5 font-mono">
+                        <!-- ENCABEZADO DE LA TIRA DE TELEMETRÍA (POD 1) -->
+                        <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5 font-mono">
+                            <div class="flex items-center gap-1.5">
                                 <span class="font-black text-sm tracking-wide ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
                                 <span class="px-1.5 py-0.2 bg-slate-900 text-cyan-300 border border-slate-700 rounded text-[9px] font-bold">${plane.model}</span>
-                                <span class="text-[8px] px-1 bg-slate-900 text-slate-400 border border-slate-700 rounded">${plane.alt_type}</span>
+                                <span class="text-[8px] px-1 bg-slate-900 text-slate-400 border border-slate-800 rounded">${plane.alt_type}</span>
                             </div>
                             ${tagHtml}
                         </div>
                         
-                        <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] font-mono text-slate-300 mt-0.5">
-                            <div><span class="text-slate-500">ALT:</span> <b>${plane.alt_ft.toLocaleString()} ft</b></div>
-                            <div><span class="text-slate-500">V/S:</span> <b>${plane.vr_fpm > 0 ? '+' : ''}${plane.vr_fpm} ft/m</b></div>
-                            <div><span class="text-slate-500">SPD:</span> <b>${plane.speed_kt} kt</b></div>
-                            <div><span class="text-slate-500">RNG:</span> <b>${plane.distance_km} km</b></div>
-                            <div><span class="text-slate-500">HDG:</span> <b>${plane.track}°</b></div>
-                            <div><span class="text-slate-500">TCA:</span> <b class="${isTransit ? 'text-red-400 font-black' : (isClose ? 'text-amber-300 font-bold' : 'text-cyan-300')}">${timerStr}</b></div>
-                            <div class="col-span-2"><span class="text-slate-500">SPAN / SIZE:</span> <b class="text-indigo-300">${plane.wingspan_m}m &bull; ${target.angular_size_arcsec}"</b></div>
+                        <!-- CAJA DIGITAL TCA Y CINEMÁTICA PRINCIPAL (POD 2 & 3) -->
+                        <div class="grid grid-cols-3 gap-1.5 items-center font-mono my-0.5">
+                            <div class="col-span-1 px-2 py-1 rounded bg-slate-950 border ${isTransit ? 'border-red-500/80 text-red-400' : (isClose ? 'border-amber-500/80 text-amber-400' : 'border-slate-800 text-cyan-400')} flex flex-col items-center justify-center">
+                                <span class="text-[7.5px] text-slate-500 uppercase font-bold tracking-wider">EST. TCA</span>
+                                <span class="text-xs font-black tabular-nums tracking-wide">${timerStr}</span>
+                            </div>
+                            <div class="col-span-2 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[9.5px]">
+                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">ALTITUDE</span><b class="tabular-nums">${plane.alt_ft.toLocaleString()} ft</b></div>
+                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">V/S RATE</span><b class="tabular-nums">${plane.vr_fpm > 0 ? '+' : ''}${plane.vr_fpm} ft/m</b></div>
+                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">SPEED</span><b class="tabular-nums">${plane.speed_kt} kt</b></div>
+                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">DISTANCE</span><b class="tabular-nums">${plane.distance_km} km</b></div>
+                            </div>
+                        </div>
+
+                        <!-- METADATOS ÓPTICOS (POD 4) -->
+                        <div class="flex justify-between items-center text-[9px] font-mono text-slate-400 border-t border-slate-800/60 pt-1">
+                            <span>HDG: <b class="text-slate-200 tabular-nums">${plane.track}°</b></span>
+                            <span>SPAN: <b class="text-slate-200 tabular-nums">${plane.wingspan_m}m</b></span>
+                            <span>ANG SIZE: <b class="text-indigo-300 tabular-nums">${target.angular_size_arcsec}"</b></span>
                         </div>
 
                         ${(isTransit || isClose) ? renderTransitDiscDiagram(target) : ''}
@@ -1543,9 +1634,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // CELESTIAL HUD & CARDS RESTORED")
-    print(f" [OK] ADS-B Collector: airplanes.live & adsb.lol (Verified)")
-    print(f" [OK] Astro Glow Cards (Moon / Sun / Observer) + Harvard Terminal: ACTIVE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // AVIONICS HUD & HARVARD KERNEL")
+    print(f" [OK] Celestial Status Cards (Glow / Az / Alt / Events): RESTORED")
+    print(f" [OK] High-Performance POD Layout & Hardware Accelerated Sweep: ACTIVE")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
