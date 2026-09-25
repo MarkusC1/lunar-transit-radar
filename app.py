@@ -39,14 +39,6 @@ WINGSPANS = {
 def get_wingspan(model_icao):
     return WINGSPANS.get(model_icao, 35.0)
 
-def safe_float(val, default=None):
-    if val is None or val == '' or val == 'null' or val == 'ground':
-        return default
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return default
-
 def calculate_atmosphere(alt_m):
     p_mbar = 1013.25 * math.pow((1.0 - 2.25577e-5 * max(0.0, alt_m)), 5.25588)
     t_c = 15.0 - (0.0065 * alt_m)
@@ -71,11 +63,10 @@ def diff_angle_deg(a, b):
 
 def geodetic_to_ecef(lat_deg, lon_deg, h_m):
     lat, lon = math.radians(lat_deg), math.radians(lon_deg)
-    sin_lat = math.sin(lat)
-    n = WGS84_A / math.sqrt(max(1e-9, 1.0 - WGS84_E2 * (sin_lat ** 2)))
+    n = WGS84_A / math.sqrt(1.0 - WGS84_E2 * (math.sin(lat) ** 2))
     x = (n + h_m) * math.cos(lat) * math.cos(lon)
     y = (n + h_m) * math.cos(lat) * math.sin(lon)
-    z = (n * (1.0 - WGS84_E2) + h_m) * sin_lat
+    z = (n * (1.0 - WGS84_E2) + h_m) * math.sin(lat)
     return x, y, z
 
 def ecef_to_enu(x, y, z, lat0_deg, lon0_deg, h0_m):
@@ -119,57 +110,62 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. GESTIÓN MULTI-FUENTE ADS-B CON AUTO-RECUPERACIÓN
+# 2. GESTIÓN DE CACHÉ ADS-B PROBADA Y ESTABLE EN RENDER
 # =========================================================================
 CACHE = {
-    'lat': 0.0, 'lon': 0.0, 'timestamp': 0.0, 'aircraft': [], 'source': 'airplanes.live'
+    'lat': 0.0,
+    'lon': 0.0,
+    'timestamp': 0.0,
+    'aircraft': [],
+    'source': 'airplanes.live'
 }
 HTTP_SESSION = requests.Session()
 
 def get_live_aircraft(cur_lat, cur_lon):
     now = time.time()
-    # Caché estricta de 2.5s para respetar las políticas de tasa de petición (Rate Limit)
-    if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.04 and abs(cur_lon - CACHE['lon']) < 0.04:
-        return CACHE['aircraft'], CACHE['source']
+    if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
+        return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/26.0'}
+    
+    # 1. airplanes.live
+    try:
+        url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
+        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
+        if r.status_code == 200:
+            data = r.json()
+            ac = data.get('ac', [])
+            if ac:
+                CACHE['lat'] = cur_lat
+                CACHE['lon'] = cur_lon
+                CACHE['timestamp'] = now
+                CACHE['aircraft'] = ac
+                CACHE['source'] = 'airplanes.live'
+                return ac, 'airplanes.live', 0.0
+    except Exception:
+        pass
 
-    # Redundancia cuádruple de servidores de datos ADS-B
-    endpoints = [
-        ('airplanes.live', f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"),
-        ('adsb.lol', f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"),
-        ('adsb.one', f"https://api.adsb.one/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"),
-        ('adsb.fi', f"https://opendata.adsb.fi/api/v2/lat/{cur_lat:.4f}/lon/{cur_lon:.4f}/dist/80")
-    ]
+    # 2. adsb.lol fallback
+    try:
+        url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
+        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
+        if r.status_code == 200:
+            data = r.json()
+            ac = data.get('ac', [])
+            if ac:
+                CACHE['lat'] = cur_lat
+                CACHE['lon'] = cur_lon
+                CACHE['timestamp'] = now
+                CACHE['aircraft'] = ac
+                CACHE['source'] = 'adsb.lol'
+                return ac, 'adsb.lol', 0.0
+    except Exception:
+        pass
 
-    for name, url in endpoints:
-        try:
-            r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    continue  # Si el servidor responde con texto plano por saturación, pasa al siguiente
-                
-                ac = data.get('ac') or data.get('aircraft') or []
-                if isinstance(ac, list) and len(ac) > 0:
-                    CACHE['lat'] = cur_lat
-                    CACHE['lon'] = cur_lon
-                    CACHE['timestamp'] = now
-                    CACHE['aircraft'] = ac
-                    CACHE['source'] = name
-                    return ac, name
-        except Exception:
-            continue
-
-    # En caso de fallo transitorio, actualiza timestamp para no bombardear el feed en bucle
-    CACHE['timestamp'] = now
-    return CACHE['aircraft'], CACHE['source']
+    return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
 
 # =========================================================================
-# 3. MOTOR ASTROMÉTRICO Y KERNEL TELEMÉTRICO HARVARD
+# 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
 # =========================================================================
 @app.route('/api/data')
 def get_data():
@@ -177,10 +173,10 @@ def get_data():
         lat = float(request.args.get('lat', 41.6079))
         lon = float(request.args.get('lon', 2.2876))
         alt = float(request.args.get('alt', 145.0))
-        user_lead_sec = float(request.args.get('lead', 7.5))
+        user_lead_sec = max(0.0, min(15.0, float(request.args.get('lead', 6.0))))
         now_epoch = time.time()
 
-        raw_ac, source_feed = get_live_aircraft(lat, lon)
+        raw_ac, source_feed, _ = get_live_aircraft(lat, lon)
 
         t_now = ts.now()
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
@@ -242,53 +238,49 @@ def get_data():
         sun_ev_type, sun_ev_str, sun_ev_sec = get_next_event(sun, sun_is_visible)
 
         aircraft_results = []
-        harvard_kernel_logs = []
-
-        now_utc_str = datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]
-        obs_x, obs_y, obs_z = geodetic_to_ecef(lat, lon, alt)
-        harvard_kernel_logs.append(f"[{now_utc_str}Z] [INIT_GEODETIC_WGS84] OBS_LAT:{lat:.5f} OBS_LON:{lon:.5f} ALT:{alt:.1f}m")
-        harvard_kernel_logs.append(f"[{now_utc_str}Z] [ECEF_ORIGIN] X:{obs_x:.2f}m Y:{obs_y:.2f}m Z:{obs_z:.2f}m | ATM_P:{p_mbar:.1f}mb T:{t_c:.1f}C")
-        harvard_kernel_logs.append(f"[{now_utc_str}Z] [TARGET_MOON] AZ:{moon_az0:.3f}° EL:{moon_alt0:.3f}° R_ANG:{moon_radius_deg:.4f}° DIST:{moon_dist_km:.1f}km")
-        harvard_kernel_logs.append(f"[{now_utc_str}Z] [FEED_INGEST] SOURCE:{source_feed} | TRACKED:{len(raw_ac)} | LEAD_COMP:+{user_lead_sec:.1f}s")
 
         for ac in raw_ac:
-            raw_lat = safe_float(ac.get('lat'))
-            raw_lon = safe_float(ac.get('lon'))
-            track_val = safe_float(ac.get('track'))
-            gs_val = safe_float(ac.get('gs'))
+            raw_lat = ac.get('lat')
+            raw_lon = ac.get('lon')
+            track = ac.get('track')
+            gs = ac.get('gs', 0)
+            vr_raw = ac.get('geom_rate', ac.get('baro_rate', 0))
+            model_icao = str(ac.get('t', 'A320')).strip().upper()
+            wingspan_m = get_wingspan(model_icao)
 
-            if None in (raw_lat, raw_lon, track_val, gs_val) or gs_val <= 15.0:
-                continue
-
-            alt_geom = safe_float(ac.get('alt_geom'))
-            alt_baro = safe_float(ac.get('alt_baro'))
-
-            if alt_geom is not None and alt_geom > -1000.0:
-                alt_ft = alt_geom
+            alt_geom = ac.get('alt_geom')
+            alt_baro = ac.get('alt_baro')
+            if alt_geom is not None and alt_geom != 'ground':
+                alt_ft = float(alt_geom)
                 alt_type = 'GNSS'
-            elif alt_baro is not None and alt_baro > -1000.0:
-                alt_ft = alt_baro
+            elif alt_baro is not None and alt_baro != 'ground':
+                alt_ft = float(alt_baro)
                 alt_type = 'BARO'
             else:
                 continue
 
-            vr_raw = safe_float(ac.get('geom_rate', ac.get('baro_rate', 0.0)), default=0.0)
-            vr_ms = vr_raw * 0.00508
-            vr_fpm = int(vr_raw)
-            callsign_str = str(ac.get('flight') or ac.get('hex', 'UNKNOWN')).strip()
-            model_icao = str(ac.get('t', 'A320')).strip().upper()
-            wingspan_m = get_wingspan(model_icao)
+            if None in (raw_lat, raw_lon, track) or gs is None or float(gs) <= 15:
+                continue
 
-            alt_m = alt_ft * 0.3048
-            speed_ms = gs_val * 0.514444
+            try:
+                alt_m = alt_ft * 0.3048
+                speed_ms = float(gs) * 0.514444
+                vr_ms = float(vr_raw) * 0.00508 if vr_raw else 0.0
+                vr_fpm = int(float(vr_raw)) if vr_raw else 0
+                track_val = float(track)
+                ac_lat = float(raw_lat)
+                ac_lon = float(raw_lon)
+            except (ValueError, TypeError):
+                continue
 
-            # Compensación cinemática segura acotada (elimina los 10s de lag sin riesgo de desborde)
-            seen_pos = safe_float(ac.get('seen_pos', ac.get('seen', 0.0)), default=1.0)
+            # Compensación cinemática limpia y segura contra el lag de Flightradar24
+            seen_pos = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
             seen_pos = max(0.0, min(15.0, seen_pos))
-            total_lead_dt = max(0.0, min(30.0, seen_pos + user_lead_sec))
-            
-            ac_lat, ac_lon = propagate_geodetic_position(raw_lat, raw_lon, speed_ms, track_val, total_lead_dt)
-            alt_m += vr_ms * total_lead_dt
+            total_lead = seen_pos + user_lead_sec
+
+            if total_lead > 0.05:
+                ac_lat, ac_lon = propagate_geodetic_position(ac_lat, ac_lon, speed_ms, track_val, total_lead)
+                alt_m += vr_ms * total_lead
 
             e0, n0, u0 = ecef_to_enu(*geodetic_to_ecef(ac_lat, ac_lon, alt_m), lat, lon, alt)
             cur_az, cur_geom_alt, cur_range = enu_to_az_alt(e0, n0, u0)
@@ -349,7 +341,7 @@ def get_data():
                 if denom > 1e-4:
                     t_analytical = (r_dot_b * v_dot_b - r_dot_v) / denom
 
-                if t_analytical < -5.0 and cur_sep > (b_rad * 4.0):
+                if t_analytical < -3.0 and cur_sep > (b_rad * 4.0):
                     return {
                         'target': body_type, 'is_transit': False, 'is_close': False,
                         'min_sep': round(cur_sep, 3), 'current_sep': round(cur_sep, 2),
@@ -362,15 +354,14 @@ def get_data():
                     }
 
                 center_t = max(0.0, min(300.0, t_analytical if t_analytical > 0 else 0.0))
-                scan_min = max(0.0, center_t - 20.0)
-                scan_max = min(300.0, center_t + 20.0)
+                scan_min = max(0.0, center_t - 7.5)
+                scan_max = min(300.0, center_t + 7.5)
                 
-                best_t = 0.0
-                min_sep, _, best_p_alt, best_p_range, best_lat, best_lon = eval_t(0.0)
+                best_t = center_t
+                min_sep, _, best_p_alt, best_p_range, best_lat, best_lon = eval_t(best_t)
 
-                num_steps = 16
-                for step in range(num_steps + 1):
-                    t_cand = scan_min + (step / float(num_steps)) * (scan_max - scan_min)
+                for step in range(16):
+                    t_cand = scan_min + (step / 15.0) * (scan_max - scan_min)
                     sep_val, _, p_alt_val, p_range_val, cand_lat, cand_lon = eval_t(t_cand)
                     if sep_val < min_sep:
                         min_sep = sep_val
@@ -379,9 +370,8 @@ def get_data():
                         best_p_range = p_range_val
                         best_lat, best_lon = cand_lat, cand_lon
 
-                # Refinado de Sección Áurea
-                a = max(0.0, best_t - 2.0)
-                b = min(300.0, best_t + 2.0)
+                a = max(0.0, best_t - 1.2)
+                b = min(300.0, best_t + 1.2)
                 phi = (1.0 + math.sqrt(5.0)) / 2.0
                 resphi = 2.0 - phi
 
@@ -472,15 +462,8 @@ def get_data():
 
             primary = moon_data if moon_is_visible else (sun_data if sun_is_visible else moon_data)
 
-            if primary['min_sep'] < 4.5:
-                harvard_kernel_logs.append(
-                    f"[{now_utc_str}Z] [TCA_KERNEL] TGT:{callsign_str} ({model_icao}) | "
-                    f"V_3D:[{ve:+.1f},{vn:+.1f},{vu:+.1f}]m/s | SEP_MIN:{primary['min_sep']:.3f}° | "
-                    f"TCA:-{primary['tca_seconds']:.2f}s | LIMB:{primary['position_descriptor']} | CHORD:{primary['transit_duration_s']:.2f}s"
-                )
-
             aircraft_results.append({
-                'callsign': callsign_str,
+                'callsign': str(ac.get('flight') or ac.get('hex', 'UNKNOWN')).strip(),
                 'model': model_icao,
                 'wingspan_m': wingspan_m,
                 'reg': str(ac.get('r', '')).strip().upper(),
@@ -489,7 +472,7 @@ def get_data():
                 'alt_ft': int(alt_ft),
                 'alt_type': alt_type,
                 'track': float(round(track_val, 1)),
-                'speed_kt': int(round(gs_val)),
+                'speed_kt': int(float(gs)),
                 'speed_ms': float(round(speed_ms, 1)),
                 'vr_fpm': vr_fpm,
                 'azimuth': float(round(cur_az, 1)),
@@ -503,9 +486,8 @@ def get_data():
         return jsonify({
             'source_feed': source_feed,
             'server_time': now_epoch,
-            'lead_used_sec': round(user_lead_sec, 2),
+            'lead_used_sec': round(user_lead_sec, 1),
             'observer_altitude_used_m': alt,
-            'kernel_logs': harvard_kernel_logs,
             'moon': {
                 'name': 'Moon', 'symbol': '🌕',
                 'azimuth': round(moon_az0, 2), 'elevation': round(moon_alt0, 2),
@@ -522,7 +504,7 @@ def get_data():
         })
 
     except Exception as e:
-        return jsonify({'error': str(e), 'aircraft': [], 'kernel_logs': [f"[CRITICAL_ERROR] {str(e)}"]})
+        return jsonify({'error': str(e), 'aircraft': []})
 
 # =========================================================================
 # 4. RUTAS DE INDEXACIÓN Y PLANTILLA HTML
@@ -536,7 +518,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND: CABINA TÁCTICA Y HARVARD ASTRO-TERMINAL
+# 5. FRONTEND: CABINA TÁCTICA, TARJETAS CELESTES Y HARVARD TERMINAL
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -545,7 +527,7 @@ HTML_TEMPLATE = r"""
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="google-site-verification" content="google92a4c5b46b2ec0bf" />
-    <title>Lunar Transit Radar PRO // Avionics & Harvard Astro-Terminal</title>
+    <title>Lunar Transit Radar PRO</title>
     
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -591,6 +573,9 @@ HTML_TEMPLATE = r"""
             box-shadow: 0 0 18px rgba(6, 182, 212, 0.15);
         }
 
+        .glow-cyan { box-shadow: 0 0 16px rgba(6, 182, 212, 0.35); }
+        .glow-amber { box-shadow: 0 0 16px rgba(245, 158, 11, 0.35); }
+
         .terminal-screen {
             background-color: #020617;
             background-image: radial-gradient(rgba(16, 185, 129, 0.1) 1px, transparent 0);
@@ -617,33 +602,63 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
         
+        <!-- ESTADO DE CUERPOS CELESTES RECUPERADOS CON GLOW Y COORDENADAS -->
+        <div class="flex items-center gap-1.5 text-xs">
+            <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer hover:border-cyan-400 transition glow-cyan ring-1 ring-cyan-400/50" onclick="setFilterMode('moon')">
+                <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
+                <div class="flex flex-col">
+                    <span id="moon-coords" class="text-cyan-300 font-bold text-[11px] leading-tight">Moon: Az --° | Alt --°</span>
+                    <span class="text-[8px] text-slate-400 font-mono">OPTICAL VECTOR LOCK</span>
+                </div>
+                <span id="moon-badge" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 text-cyan-400 rounded border border-cyan-800 font-mono font-bold">--:--</span>
+            </div>
+
+            <div id="sun-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-amber-400 transition" onclick="setFilterMode('sun')">
+                <div id="header-sun-icon" class="w-5 h-5 flex items-center justify-center"></div>
+                <div class="flex flex-col">
+                    <span id="sun-coords" class="text-amber-300 font-bold text-[11px] leading-tight">Sun: Az --° | Alt --°</span>
+                    <span class="text-[8px] text-slate-400 font-mono">SOLAR SIGHT LINE</span>
+                </div>
+                <span id="sun-badge" class="text-[9px] px-1.5 py-0.5 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono font-bold">--:--</span>
+            </div>
+
+            <div class="hidden sm:flex bg-slate-950/90 px-2 py-1 rounded-lg border border-slate-800 items-center gap-1.5">
+                <span id="obs-coords" class="text-cyan-400 font-bold text-[11px]">41.6079, 2.2876</span>
+                <span id="obs-alt-badge" class="text-emerald-300 font-bold text-[11px]">⛰️ 145m</span>
+                <button id="lock-btn" onclick="toggleLocationLock()" class="text-[10px] px-1 bg-slate-900 hover:bg-slate-800 text-slate-300 rounded border border-slate-700 font-bold transition">
+                    🔒
+                </button>
+            </div>
+        </div>
+
         <!-- CONTROL DE SINCRONIZACIÓN DE LATENCIA (LEAD SYNC) -->
         <div class="flex items-center gap-1 bg-slate-950 px-2 py-1 rounded-lg border border-slate-800">
-            <span class="text-[10px] text-slate-400 font-bold">⚡ LEAD SYNC:</span>
+            <span class="text-[10px] text-slate-400 font-bold">⚡ LEAD:</span>
             <button onclick="adjustLead(-0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">-</button>
-            <span id="lead-display" class="font-mono text-xs font-black text-amber-400 min-w-[50px] text-center">+7.5s</span>
+            <span id="lead-display" class="font-mono text-xs font-black text-amber-400 min-w-[46px] text-center">+6.0s</span>
             <button onclick="adjustLead(0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">+</button>
+        </div>
+
+        <!-- SELECTOR DE FILTROS MOON / SUN / DUAL -->
+        <div class="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
+            <button id="btn-flt-moon" onclick="setFilterMode('moon')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_10px_rgba(6,182,212,0.4)]">🌔 Moon</button>
+            <button id="btn-flt-sun" onclick="setFilterMode('sun')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-amber-300">☀️ Sun</button>
+            <button id="btn-flt-all" onclick="setFilterMode('all')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-white">Dual</button>
         </div>
 
         <!-- CONMUTADOR: MAPA TÁCTICO VS TERMINAL HARVARD -->
         <div class="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
-            <button id="view-map-btn" onclick="setViewMode('map')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">
-                🗺️ Radar Map
+            <button id="view-map-btn" onclick="setViewMode('map')" class="text-[10px] px-2 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">
+                🗺️ Map
             </button>
-            <button id="view-terminal-btn" onclick="setViewMode('terminal')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1">
+            <button id="view-terminal-btn" onclick="setViewMode('terminal')" class="text-[10px] px-2 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1">
                 <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
-                💻 Harvard Astro-Terminal
+                💻 Terminal
             </button>
         </div>
 
         <!-- HERRAMIENTAS Y UBICACIÓN -->
-        <div class="flex items-center gap-1.5">
-            <div class="bg-slate-950 p-0.5 rounded-lg border border-slate-800 flex">
-                <button id="btn-flt-moon" onclick="setFilterMode('moon')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">🌔 Moon</button>
-                <button id="btn-flt-sun" onclick="setFilterMode('sun')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-amber-300">☀️ Sun</button>
-                <button id="btn-flt-all" onclick="setFilterMode('all')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-white">Dual</button>
-            </div>
-
+        <div class="flex items-center gap-1">
             <button id="voice-btn" onclick="toggleVoice()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">🗣️</button>
             <button id="audio-btn" onclick="toggleAudio()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">🔇</button>
             <button onclick="toggleSettingsModal()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">⚙️</button>
@@ -674,12 +689,12 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- VISTA 2: HARVARD ASTRO-TERMINAL -->
+        <!-- VISTA 2: HARVARD ASTRO-TERMINAL (CONSOLA HACKER DESACOPLADA) -->
         <div id="terminal-viewport" class="lg:col-span-3 rounded-xl overflow-hidden border border-emerald-900/60 relative shadow-2xl flex flex-col hidden terminal-screen">
             <div class="bg-slate-950 px-3 py-2 border-b border-emerald-900/50 flex justify-between items-center text-xs">
                 <div class="flex items-center gap-2">
                     <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span class="font-bold text-emerald-400 font-mono tracking-wider">HARVARD CENTER FOR ASTROPHYSICS // KINEMATICS ENGINE DE421</span>
+                    <span class="font-bold text-emerald-400 font-mono tracking-wider">HARVARD CENTER FOR ASTROPHYSICS // ASTRO-RADAR KERNEL DE421</span>
                 </div>
                 <div class="flex items-center gap-2">
                     <button id="term-pause-btn" onclick="toggleTerminalPause()" class="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]">⏸ Pause</button>
@@ -689,7 +704,7 @@ HTML_TEMPLATE = r"""
             </div>
             
             <div id="terminal-output" class="p-3 font-mono text-[11px] text-emerald-400/90 overflow-y-auto flex-grow flex flex-col gap-1 leading-relaxed selection:bg-emerald-900 selection:text-white">
-                <div class="text-slate-500">// HARVARD ASTRO-ENGINE INITIALIZED. STREAMING ORBITAL TELEMETRY...</div>
+                <div class="text-slate-500">// HARVARD ASTRO-KERNEL INITIALIZED. REAL-TIME ASTRODYNAMICS TELEMETRY ACTIVE.</div>
             </div>
 
             <div class="bg-slate-950/90 border-t border-emerald-900/40 p-2 flex justify-between items-center text-[10px] text-slate-400 font-mono">
@@ -748,7 +763,7 @@ HTML_TEMPLATE = r"""
         let observerLon = parseFloat(localStorage.getItem('obs_lon') || 2.2876);
         let terrainElevationM = 145.0;
         let buildingOffsetM = parseFloat(localStorage.getItem('obs_building_m') || 0.0);
-        let userLeadSec = parseFloat(localStorage.getItem('user_lead_sec') || 7.5);
+        let userLeadSec = parseFloat(localStorage.getItem('user_lead_sec') || 6.0);
 
         let activeFilter = 'moon';
         let viewMode = 'map';
@@ -825,7 +840,7 @@ HTML_TEMPLATE = r"""
         });
 
         function adjustLead(delta) {
-            userLeadSec = Math.max(-5.0, Math.min(25.0, Math.round((userLeadSec + delta) * 10) / 10));
+            userLeadSec = Math.max(0.0, Math.min(15.0, Math.round((userLeadSec + delta) * 10) / 10));
             localStorage.setItem('user_lead_sec', userLeadSec.toFixed(1));
             document.getElementById('lead-display').innerText = (userLeadSec >= 0 ? '+' : '') + userLeadSec.toFixed(1) + 's';
         }
@@ -840,14 +855,14 @@ HTML_TEMPLATE = r"""
             if (mode === 'map') {
                 mapV.classList.remove('hidden');
                 termV.classList.add('hidden');
-                mapB.className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800";
-                termB.className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1";
+                mapB.className = "text-[10px] px-2 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800";
+                termB.className = "text-[10px] px-2 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1";
                 map.invalidateSize();
             } else {
                 mapV.classList.add('hidden');
                 termV.classList.remove('hidden');
-                termB.className = "text-[10px] px-2.5 py-1 rounded font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-1";
-                mapB.className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-cyan-300";
+                termB.className = "text-[10px] px-2 py-1 rounded font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-1";
+                mapB.className = "text-[10px] px-2 py-1 rounded font-bold text-slate-400 hover:text-cyan-300";
             }
         }
 
@@ -861,7 +876,7 @@ HTML_TEMPLATE = r"""
         }
 
         function clearTerminal() {
-            document.getElementById('terminal-output').innerHTML = '<div class="text-slate-500">// TERMINAL BUFFER CLEARED. AWAITING PIPELINE STREAM...</div>';
+            document.getElementById('terminal-output').innerHTML = '<div class="text-slate-500">// BUFFER CLEARED. LISTENING TO KERNEL DATA...</div>';
         }
 
         function copyTerminal() {
@@ -891,15 +906,44 @@ HTML_TEMPLATE = r"""
                 document.getElementById(id).className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-white";
             });
 
+            const moonCard = document.getElementById('moon-status-card');
+            const sunCard = document.getElementById('sun-status-card');
+            const footerInd = document.getElementById('footer-vector-indicator');
+            const footerInfo = document.getElementById('footer-astro-info');
+
             if (mode === 'moon') {
-                document.getElementById('btn-flt-moon').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800";
+                document.getElementById('btn-flt-moon').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_10px_rgba(6,182,212,0.4)]";
                 document.getElementById('filter-indicator').innerText = "TARGET: 🌕 MOON";
+                if (moonCard) {
+                    moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer transition glow-cyan ring-1 ring-cyan-400/50";
+                }
+                if (sunCard) {
+                    sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-amber-400 transition";
+                }
+                footerInd.innerHTML = `<span class="text-cyan-400 font-bold">🌕──────</span>`;
+                footerInfo.innerText = "Optical Sight Line to the Moon";
             } else if (mode === 'sun') {
-                document.getElementById('btn-flt-sun').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-amber-950 text-amber-300 border border-amber-800";
+                document.getElementById('btn-flt-sun').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-amber-950 text-amber-300 border border-amber-800 shadow-[0_0_10px_rgba(245,158,11,0.4)]";
                 document.getElementById('filter-indicator').innerText = "TARGET: ☀️ SUN";
+                if (sunCard) {
+                    sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-500 flex items-center gap-2 cursor-pointer transition glow-amber ring-1 ring-amber-400/50";
+                }
+                if (moonCard) {
+                    moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-cyan-400 transition";
+                }
+                footerInd.innerHTML = `<span class="text-amber-400 font-bold">☀️──────</span>`;
+                footerInfo.innerText = "Optical Sight Line to the Sun";
             } else {
-                document.getElementById('btn-flt-all').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-slate-800 text-cyan-300";
-                document.getElementById('filter-indicator').innerText = "TARGET: DUAL (SUN/MOON)";
+                document.getElementById('btn-flt-all').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-slate-800 text-cyan-300 border border-slate-600 shadow-[0_0_10px_rgba(6,182,212,0.2)]";
+                document.getElementById('filter-indicator').innerText = "TARGET: DUAL (SUN & MOON)";
+                if (moonCard) {
+                    moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-800 flex items-center gap-2 cursor-pointer transition glow-cyan";
+                }
+                if (sunCard) {
+                    sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-800 flex items-center gap-2 cursor-pointer transition glow-amber";
+                }
+                footerInd.innerHTML = `<span class="text-cyan-400 font-bold">🌕──</span> <span class="text-amber-400 font-bold">☀️──</span>`;
+                footerInfo.innerText = "Dual Optical Sight Lines Active";
             }
             renderAstroVectors();
             updateHUDCountdowns();
@@ -996,6 +1040,7 @@ HTML_TEMPLATE = r"""
             observerLat = lat; observerLon = lon;
             localStorage.setItem('obs_lat', lat.toString());
             localStorage.setItem('obs_lon', lon.toString());
+            document.getElementById('obs-coords').innerText = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
             fetchTerrainElevation(lat, lon);
             drawRangeRings();
             renderAstroVectors();
@@ -1152,22 +1197,41 @@ HTML_TEMPLATE = r"""
                     document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
                 }
 
-                document.getElementById('moon-coords').innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
-                document.getElementById('sun-coords').innerText = sunDataGlobal.visible ? `Sun: Az ${sunDataGlobal.azimuth}° | Alt +${sunDataGlobal.elevation}°` : `Sun Hidden (${sunDataGlobal.elevation}°)`;
+                // Actualización de coordenadas celestes y badges
+                const mCoords = document.getElementById('moon-coords');
+                const mBadge = document.getElementById('moon-badge');
+                if (mCoords) mCoords.innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
+                if (mBadge) mBadge.innerText = `${moonDataGlobal.event_type}: ${moonDataGlobal.next_event_str}`;
+
+                const sCoords = document.getElementById('sun-coords');
+                const sBadge = document.getElementById('sun-badge');
+                if (sCoords) sCoords.innerText = sunDataGlobal.visible ? `Sun: Az ${sunDataGlobal.azimuth}° | Alt +${sunDataGlobal.elevation}°` : `Sun Hidden (${sunDataGlobal.elevation}°)`;
+                if (sBadge) sBadge.innerText = `${sunDataGlobal.event_type}: ${sunDataGlobal.next_event_str}`;
 
                 renderAstroVectors();
 
-                if (!terminalPaused && data.kernel_logs && data.kernel_logs.length > 0) {
+                if (!terminalPaused) {
                     const term = document.getElementById('terminal-output');
-                    data.kernel_logs.forEach(l => {
-                        const div = document.createElement('div');
-                        div.innerText = l;
-                        term.appendChild(div);
-                    });
-                    while (term.children.length > 250) term.removeChild(term.firstChild);
+                    const nowStr = new Date().toISOString().replace('T', ' ').slice(11, 23);
+                    
+                    const logEntry = document.createElement('div');
+                    logEntry.innerHTML = `[${nowStr}Z] <span class="text-cyan-400">RADAR_KERNEL:</span> OBS=[${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}] | TARGETS=${data.aircraft ? data.aircraft.length : 0} | FEED=${data.source_feed} | LEAD=+${userLeadSec}s`;
+                    term.appendChild(logEntry);
+
+                    if (data.aircraft) {
+                        data.aircraft.slice(0, 3).forEach(p => {
+                            const target = p.primary;
+                            const subEntry = document.createElement('div');
+                            subEntry.className = "text-[10px] pl-4 text-emerald-400/80";
+                            subEntry.innerHTML = `&bull; TGT:<b>${p.callsign}</b> (${p.model}) | FL${Math.round(p.alt_ft/100)} | DIST:${p.distance_km}km | SEP:${target.min_sep}° | TCA:${target.tca_seconds}s | CHORD:${target.position_descriptor}`;
+                            term.appendChild(subEntry);
+                        });
+                    }
+
+                    while (term.children.length > 200) term.removeChild(term.firstChild);
                     term.scrollTop = term.scrollHeight;
+                    document.getElementById('terminal-clock').innerText = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
                 }
-                document.getElementById('terminal-clock').innerText = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 
                 activeAircraftData = data.aircraft || [];
                 document.getElementById('plane-count').innerText = activeAircraftData.length;
@@ -1459,6 +1523,11 @@ HTML_TEMPLATE = r"""
 
         document.getElementById('lead-display').innerText = (userLeadSec >= 0 ? '+' : '') + userLeadSec.toFixed(1) + 's';
         document.getElementById('building-offset').value = buildingOffsetM.toString();
+        document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
+
+        // Iconos vectoriales de la Luna y Sol en la barra superior
+        document.getElementById('header-moon-icon').innerHTML = getRealisticMoonSvgHtml(20);
+        document.getElementById('header-sun-icon').innerHTML = getRealisticSunSvgHtml(20);
 
         drawRangeRings();
         fetchData();
@@ -1474,9 +1543,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // HARVARD BULLETPROOF ENGINE")
-    print(f" [OK] Quad ADS-B Failover: airplanes.live / adsb.lol / adsb.one / adsb.fi")
-    print(f" [OK] Bounded Lead Siphon (0-30s) + Harvard Terminal: ACTIVE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // CELESTIAL HUD & CARDS RESTORED")
+    print(f" [OK] ADS-B Collector: airplanes.live & adsb.lol (Verified)")
+    print(f" [OK] Astro Glow Cards (Moon / Sun / Observer) + Harvard Terminal: ACTIVE")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
