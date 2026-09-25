@@ -119,51 +119,54 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. GESTIÓN DE CACHÉ ADS-B
+# 2. GESTIÓN MULTI-FUENTE ADS-B CON AUTO-RECUPERACIÓN
 # =========================================================================
 CACHE = {
-    'lat': 0.0, 'lon': 0.0, 'timestamp': 0.0, 'aircraft': [], 'source': 'airplanes.live', 'feed_now': 0.0
+    'lat': 0.0, 'lon': 0.0, 'timestamp': 0.0, 'aircraft': [], 'source': 'airplanes.live'
 }
 HTTP_SESSION = requests.Session()
 
 def get_live_aircraft(cur_lat, cur_lon):
     now = time.time()
-    if now - CACHE['timestamp'] < 1.8 and abs(cur_lat - CACHE['lat']) < 0.04 and abs(cur_lon - CACHE['lon']) < 0.04:
-        return CACHE['aircraft'], CACHE['source'], CACHE['feed_now']
+    # Caché estricta de 2.5s para respetar las políticas de tasa de petición (Rate Limit)
+    if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.04 and abs(cur_lon - CACHE['lon']) < 0.04:
+        return CACHE['aircraft'], CACHE['source']
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/27.0'}
-    
-    # 1. airplanes.live
-    try:
-        url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=1.8)
-        if r.status_code == 200:
-            data = r.json()
-            ac = data.get('ac', [])
-            feed_now = safe_float(data.get('now'), default=now)
-            if feed_now > 1e11: feed_now /= 1000.0
-            if ac:
-                CACHE['lat'], CACHE['lon'], CACHE['timestamp'], CACHE['aircraft'], CACHE['source'], CACHE['feed_now'] = cur_lat, cur_lon, now, ac, 'airplanes.live', feed_now
-                return ac, 'airplanes.live', feed_now
-    except Exception:
-        pass
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    }
 
-    # 2. adsb.lol fallback
-    try:
-        url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=1.8)
-        if r.status_code == 200:
-            data = r.json()
-            ac = data.get('ac', [])
-            feed_now = safe_float(data.get('now'), default=now)
-            if feed_now > 1e11: feed_now /= 1000.0
-            if ac:
-                CACHE['lat'], CACHE['lon'], CACHE['timestamp'], CACHE['aircraft'], CACHE['source'], CACHE['feed_now'] = cur_lat, cur_lon, now, ac, 'adsb.lol', feed_now
-                return ac, 'adsb.lol', feed_now
-    except Exception:
-        pass
+    # Redundancia cuádruple de servidores de datos ADS-B
+    endpoints = [
+        ('airplanes.live', f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"),
+        ('adsb.lol', f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"),
+        ('adsb.one', f"https://api.adsb.one/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"),
+        ('adsb.fi', f"https://opendata.adsb.fi/api/v2/lat/{cur_lat:.4f}/lon/{cur_lon:.4f}/dist/80")
+    ]
 
-    return CACHE['aircraft'], CACHE['source'], CACHE['feed_now']
+    for name, url in endpoints:
+        try:
+            r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                except Exception:
+                    continue  # Si el servidor responde con texto plano por saturación, pasa al siguiente
+                
+                ac = data.get('ac') or data.get('aircraft') or []
+                if isinstance(ac, list) and len(ac) > 0:
+                    CACHE['lat'] = cur_lat
+                    CACHE['lon'] = cur_lon
+                    CACHE['timestamp'] = now
+                    CACHE['aircraft'] = ac
+                    CACHE['source'] = name
+                    return ac, name
+        except Exception:
+            continue
+
+    # En caso de fallo transitorio, actualiza timestamp para no bombardear el feed en bucle
+    CACHE['timestamp'] = now
+    return CACHE['aircraft'], CACHE['source']
 
 # =========================================================================
 # 3. MOTOR ASTROMÉTRICO Y KERNEL TELEMÉTRICO HARVARD
@@ -174,11 +177,10 @@ def get_data():
         lat = float(request.args.get('lat', 41.6079))
         lon = float(request.args.get('lon', 2.2876))
         alt = float(request.args.get('alt', 145.0))
-        user_lead_sec = float(request.args.get('lead', 7.5)) # Compensación de retardo ADS-B
+        user_lead_sec = float(request.args.get('lead', 7.5))
         now_epoch = time.time()
 
-        raw_ac, source_feed, feed_now_ts = get_live_aircraft(lat, lon)
-        pipeline_lag = max(0.0, now_epoch - feed_now_ts) if feed_now_ts > 0 else 2.5
+        raw_ac, source_feed = get_live_aircraft(lat, lon)
 
         t_now = ts.now()
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
@@ -242,12 +244,12 @@ def get_data():
         aircraft_results = []
         harvard_kernel_logs = []
 
-        # Registro inicial de cabecera en el terminal
+        now_utc_str = datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]
         obs_x, obs_y, obs_z = geodetic_to_ecef(lat, lon, alt)
-        harvard_kernel_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}Z] [INIT_GEODETIC_WGS84] OBS_LAT:{lat:.5f} OBS_LON:{lon:.5f} ALT:{alt:.1f}m")
-        harvard_kernel_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}Z] [ECEF_ORIGIN] X:{obs_x:.2f}m Y:{obs_y:.2f}m Z:{obs_z:.2f}m | ATM_P:{p_mbar:.1f}mb T:{t_c:.1f}C")
-        harvard_kernel_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}Z] [ASTRO_TARGET_MOON] AZ:{moon_az0:.3f}° EL:{moon_alt0:.3f}° R_ANG:{moon_radius_deg:.4f}° DIST:{moon_dist_km:.1f}km")
-        harvard_kernel_logs.append(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}Z] [SYNC_ENGINE] FEED_LAG:{pipeline_lag:.2f}s USER_LEAD_OFFSET:+{user_lead_sec:.1f}s TOTAL_ADVANCE:+{pipeline_lag+user_lead_sec:.2f}s")
+        harvard_kernel_logs.append(f"[{now_utc_str}Z] [INIT_GEODETIC_WGS84] OBS_LAT:{lat:.5f} OBS_LON:{lon:.5f} ALT:{alt:.1f}m")
+        harvard_kernel_logs.append(f"[{now_utc_str}Z] [ECEF_ORIGIN] X:{obs_x:.2f}m Y:{obs_y:.2f}m Z:{obs_z:.2f}m | ATM_P:{p_mbar:.1f}mb T:{t_c:.1f}C")
+        harvard_kernel_logs.append(f"[{now_utc_str}Z] [TARGET_MOON] AZ:{moon_az0:.3f}° EL:{moon_alt0:.3f}° R_ANG:{moon_radius_deg:.4f}° DIST:{moon_dist_km:.1f}km")
+        harvard_kernel_logs.append(f"[{now_utc_str}Z] [FEED_INGEST] SOURCE:{source_feed} | TRACKED:{len(raw_ac)} | LEAD_COMP:+{user_lead_sec:.1f}s")
 
         for ac in raw_ac:
             raw_lat = safe_float(ac.get('lat'))
@@ -280,9 +282,10 @@ def get_data():
             alt_m = alt_ft * 0.3048
             speed_ms = gs_val * 0.514444
 
-            # Extrapolación cinemática predictiva contra el retraso de Flightradar24
-            seen_pos = safe_float(ac.get('seen_pos', ac.get('seen', 0.0)), default=0.0)
-            total_lead_dt = max(0.0, pipeline_lag + seen_pos + user_lead_sec)
+            # Compensación cinemática segura acotada (elimina los 10s de lag sin riesgo de desborde)
+            seen_pos = safe_float(ac.get('seen_pos', ac.get('seen', 0.0)), default=1.0)
+            seen_pos = max(0.0, min(15.0, seen_pos))
+            total_lead_dt = max(0.0, min(30.0, seen_pos + user_lead_sec))
             
             ac_lat, ac_lon = propagate_geodetic_position(raw_lat, raw_lon, speed_ms, track_val, total_lead_dt)
             alt_m += vr_ms * total_lead_dt
@@ -330,7 +333,6 @@ def get_data():
                     sep = angular_separation(p_az, p_app_alt, b_az_t, b_alt_t)
                     return sep, p_az, p_app_alt, p_range, p_lat, p_lon
 
-                # Estimación analítica inicial
                 b_rad_az = math.radians(b_az0)
                 b_rad_alt = math.radians(b_alt0)
                 bx = math.cos(b_rad_alt) * math.sin(b_rad_az)
@@ -359,15 +361,14 @@ def get_data():
                         'tca_lat': ac_lat, 'tca_lon': ac_lon
                     }
 
-                # Ventana adaptativa con barrido seguro
                 center_t = max(0.0, min(300.0, t_analytical if t_analytical > 0 else 0.0))
-                scan_min = max(0.0, center_t - 25.0)
-                scan_max = min(300.0, center_t + 25.0)
+                scan_min = max(0.0, center_t - 20.0)
+                scan_max = min(300.0, center_t + 20.0)
                 
                 best_t = 0.0
                 min_sep, _, best_p_alt, best_p_range, best_lat, best_lon = eval_t(0.0)
 
-                num_steps = 18
+                num_steps = 16
                 for step in range(num_steps + 1):
                     t_cand = scan_min + (step / float(num_steps)) * (scan_max - scan_min)
                     sep_val, _, p_alt_val, p_range_val, cand_lat, cand_lon = eval_t(t_cand)
@@ -378,9 +379,9 @@ def get_data():
                         best_p_range = p_range_val
                         best_lat, best_lon = cand_lat, cand_lon
 
-                # Refinado de extrema precisión (Golden Section)
-                a = max(0.0, best_t - 2.5)
-                b = min(300.0, best_t + 2.5)
+                # Refinado de Sección Áurea
+                a = max(0.0, best_t - 2.0)
+                b = min(300.0, best_t + 2.0)
                 phi = (1.0 + math.sqrt(5.0)) / 2.0
                 resphi = 2.0 - phi
 
@@ -389,17 +390,13 @@ def get_data():
                 f1, _, _, _, _, _ = eval_t(x1)
                 f2, _, _, _, _, _ = eval_t(x2)
 
-                for _ in range(14):
+                for _ in range(12):
                     if f1 < f2:
-                        b = x2
-                        x2 = x1
-                        f2 = f1
+                        b = x2; x2 = x1; f2 = f1
                         x1 = a + resphi * (b - a)
                         f1, _, _, _, _, _ = eval_t(x1)
                     else:
-                        a = x1
-                        x1 = x2
-                        f1 = f2
+                        a = x1; x1 = x2; f1 = f2
                         x2 = b - resphi * (b - a)
                         f2, _, _, _, _, _ = eval_t(x2)
 
@@ -475,12 +472,11 @@ def get_data():
 
             primary = moon_data if moon_is_visible else (sun_data if sun_is_visible else moon_data)
 
-            # Volcado de telemetría Harvard para aeronaves en aproximación
-            if primary['min_sep'] < 4.0:
+            if primary['min_sep'] < 4.5:
                 harvard_kernel_logs.append(
-                    f"[{datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]}Z] [TCA_SOLVER_HIT] AC:{callsign_str} ({model_icao}) "
-                    f"V_3D:[{ve:.1f},{vn:.1f},{vu:.1f}]m/s | SEP_MIN:{primary['min_sep']:.3f}° TCA_T:-{primary['tca_seconds']:.2f}s "
-                    f"CHORD:{primary['position_descriptor']} SPAN:{wingspan_m}m ANG_SIZE:{primary['angular_size_arcsec']}\""
+                    f"[{now_utc_str}Z] [TCA_KERNEL] TGT:{callsign_str} ({model_icao}) | "
+                    f"V_3D:[{ve:+.1f},{vn:+.1f},{vu:+.1f}]m/s | SEP_MIN:{primary['min_sep']:.3f}° | "
+                    f"TCA:-{primary['tca_seconds']:.2f}s | LIMB:{primary['position_descriptor']} | CHORD:{primary['transit_duration_s']:.2f}s"
                 )
 
             aircraft_results.append({
@@ -507,7 +503,6 @@ def get_data():
         return jsonify({
             'source_feed': source_feed,
             'server_time': now_epoch,
-            'pipeline_lag_sec': round(pipeline_lag, 2),
             'lead_used_sec': round(user_lead_sec, 2),
             'observer_altitude_used_m': alt,
             'kernel_logs': harvard_kernel_logs,
@@ -596,7 +591,6 @@ HTML_TEMPLATE = r"""
             box-shadow: 0 0 18px rgba(6, 182, 212, 0.15);
         }
 
-        /* Terminal CRT Hacker / Harvard */
         .terminal-screen {
             background-color: #020617;
             background-image: radial-gradient(rgba(16, 185, 129, 0.1) 1px, transparent 0);
@@ -623,12 +617,12 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
         
-        <!-- CONTROL DE SINCRONIZACIÓN DE LATENCIA (EXTRAPOLADOR CONTRA FLIGHTRADAR24) -->
+        <!-- CONTROL DE SINCRONIZACIÓN DE LATENCIA (LEAD SYNC) -->
         <div class="flex items-center gap-1 bg-slate-950 px-2 py-1 rounded-lg border border-slate-800">
             <span class="text-[10px] text-slate-400 font-bold">⚡ LEAD SYNC:</span>
-            <button onclick="adjustLead(-0.5)" class="px-1.5 py-0.2 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">-</button>
+            <button onclick="adjustLead(-0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">-</button>
             <span id="lead-display" class="font-mono text-xs font-black text-amber-400 min-w-[50px] text-center">+7.5s</span>
-            <button onclick="adjustLead(0.5)" class="px-1.5 py-0.2 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">+</button>
+            <button onclick="adjustLead(0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs">+</button>
         </div>
 
         <!-- CONMUTADOR: MAPA TÁCTICO VS TERMINAL HARVARD -->
@@ -657,7 +651,7 @@ HTML_TEMPLATE = r"""
         </div>
     </header>
 
-    <!-- CUERPO PRINCIPAL (VISTA MAPA O TERMINAL HARVARD) -->
+    <!-- CUERPO PRINCIPAL -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-1.5 flex-grow overflow-hidden relative">
         
         <!-- VISTA 1: RADAR MAP -->
@@ -680,7 +674,7 @@ HTML_TEMPLATE = r"""
             </div>
         </div>
 
-        <!-- VISTA 2: HARVARD ASTRO-TERMINAL (CONSOLA HACKER EN VIVO) -->
+        <!-- VISTA 2: HARVARD ASTRO-TERMINAL -->
         <div id="terminal-viewport" class="lg:col-span-3 rounded-xl overflow-hidden border border-emerald-900/60 relative shadow-2xl flex flex-col hidden terminal-screen">
             <div class="bg-slate-950 px-3 py-2 border-b border-emerald-900/50 flex justify-between items-center text-xs">
                 <div class="flex items-center gap-2">
@@ -688,6 +682,7 @@ HTML_TEMPLATE = r"""
                     <span class="font-bold text-emerald-400 font-mono tracking-wider">HARVARD CENTER FOR ASTROPHYSICS // KINEMATICS ENGINE DE421</span>
                 </div>
                 <div class="flex items-center gap-2">
+                    <button id="term-pause-btn" onclick="toggleTerminalPause()" class="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]">⏸ Pause</button>
                     <button onclick="clearTerminal()" class="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]">Clear</button>
                     <button onclick="copyTerminal()" class="px-2 py-0.5 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded text-[10px]">Copy Buffer</button>
                 </div>
@@ -757,6 +752,7 @@ HTML_TEMPLATE = r"""
 
         let activeFilter = 'moon';
         let viewMode = 'map';
+        let terminalPaused = false;
         let isLocationLocked = true;
         let serverClockDelta = 0.0;
         let audioEnabled = false;
@@ -829,10 +825,9 @@ HTML_TEMPLATE = r"""
         });
 
         function adjustLead(delta) {
-            userLeadSec = Math.max(-5.0, Math.min(25.0, userLeadSec + delta));
+            userLeadSec = Math.max(-5.0, Math.min(25.0, Math.round((userLeadSec + delta) * 10) / 10));
             localStorage.setItem('user_lead_sec', userLeadSec.toFixed(1));
             document.getElementById('lead-display').innerText = (userLeadSec >= 0 ? '+' : '') + userLeadSec.toFixed(1) + 's';
-            fetchData();
         }
 
         function setViewMode(mode) {
@@ -856,8 +851,17 @@ HTML_TEMPLATE = r"""
             }
         }
 
+        function toggleTerminalPause() {
+            terminalPaused = !terminalPaused;
+            const btn = document.getElementById('term-pause-btn');
+            btn.innerText = terminalPaused ? "▶ Resume" : "⏸ Pause";
+            btn.className = terminalPaused 
+                ? "px-2 py-0.5 bg-amber-950 text-amber-300 border border-amber-800 rounded text-[10px]"
+                : "px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]";
+        }
+
         function clearTerminal() {
-            document.getElementById('terminal-output').innerHTML = '<div class="text-slate-500">// TERMINAL BUFFER CLEARED. LISTENING FOR HARVARD KERNEL PIPELINE...</div>';
+            document.getElementById('terminal-output').innerHTML = '<div class="text-slate-500">// TERMINAL BUFFER CLEARED. AWAITING PIPELINE STREAM...</div>';
         }
 
         function copyTerminal() {
@@ -1153,15 +1157,14 @@ HTML_TEMPLATE = r"""
 
                 renderAstroVectors();
 
-                // Actualizar buffer de la consola Harvard
-                if (data.kernel_logs && data.kernel_logs.length > 0) {
+                if (!terminalPaused && data.kernel_logs && data.kernel_logs.length > 0) {
                     const term = document.getElementById('terminal-output');
                     data.kernel_logs.forEach(l => {
                         const div = document.createElement('div');
                         div.innerText = l;
                         term.appendChild(div);
                     });
-                    while (term.children.length > 300) term.removeChild(term.firstChild);
+                    while (term.children.length > 250) term.removeChild(term.firstChild);
                     term.scrollTop = term.scrollHeight;
                 }
                 document.getElementById('terminal-clock').innerText = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
@@ -1206,6 +1209,17 @@ HTML_TEMPLATE = r"""
                         const marker = L.marker([plane.lat, plane.lon], {
                             icon: L.divIcon({ className: '', html: planeHtml, iconSize: [24, 24], iconAnchor: [12, 12] })
                         }).addTo(map);
+
+                        marker.bindPopup(`
+                            <div style="font-family: monospace; font-size: 11px; color:#000;">
+                                <b>VUELO:</b> ${plane.callsign} (${plane.model})<br>
+                                <b>REG:</b> ${plane.reg || 'N/A'}<br>
+                                <b>ALT:</b> ${plane.alt_ft.toLocaleString()} ft [${plane.alt_type}] (${plane.vr_fpm > 300 ? '↗' : (plane.vr_fpm < -300 ? '↘' : '→')} ${plane.vr_fpm} ft/m)<br>
+                                <b>VEL:</b> ${plane.speed_kt} kt | <b>DIST:</b> ${plane.distance_km} km<br>
+                                <b>ENVERGADURA:</b> ${plane.wingspan_m}m | <b>T. ANGULAR:</b> ${plane.moon.angular_size_arcsec}"<br>
+                                <b>RUMBO:</b> ${plane.track}°
+                            </div>
+                        `);
 
                         planesState[cs] = {
                             marker: marker,
@@ -1449,7 +1463,7 @@ HTML_TEMPLATE = r"""
         drawRangeRings();
         fetchData();
         fetchTerrainElevation(observerLat, observerLon);
-        setInterval(fetchData, 1800);
+        setInterval(fetchData, 2500);
         setInterval(updateHUDCountdowns, 100);
         requestAnimationFrame(animateFrame);
     </script>
@@ -1460,9 +1474,9 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // HARVARD ENGINE")
-    print(f" [OK] Predictive Lead Extrapolator: ACTIVE")
-    print(f" [OK] Harvard Terminal Stream: ACTIVE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // HARVARD BULLETPROOF ENGINE")
+    print(f" [OK] Quad ADS-B Failover: airplanes.live / adsb.lol / adsb.one / adsb.fi")
+    print(f" [OK] Bounded Lead Siphon (0-30s) + Harvard Terminal: ACTIVE")
     print(f" [OK] Server Online on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
