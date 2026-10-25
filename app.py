@@ -1,4 +1,5 @@
 import math
+import threading
 import time
 import os
 import requests
@@ -110,59 +111,122 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. GESTIÓN DE CACHÉ ADS-B ESTABLE EN RENDER
+# 2. INGESTA ADS-B CON TIEMPO EXACTO POR POSICIÓN
+#    Cada posición lleva su instante real de medida (_pos_t = now_API - seen_pos).
+#    La edad se calcula en el momento del cálculo, así que caché, latencia de red
+#    y reutilización de snapshots quedan compensadas automáticamente.
 # =========================================================================
-CACHE = {
-    'lat': 0.0,
-    'lon': 0.0,
-    'timestamp': 0.0,
-    'aircraft': [],
-    'source': 'airplanes.live'
-}
+UPSTREAMS = (
+    ('airplanes.live', 'https://api.airplanes.live/v2/point/{lat:.4f}/{lon:.4f}/80'),
+    ('adsb.lol', 'https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/80'),
+)
+HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/27.0'}
+CELL_DEG = 0.1            # rejilla de caché (~11 km) compartida entre usuarios; el radio de 80 nm lo cubre de sobra
+FRESH_TTL_S = 0.9         # un snapshot más joven que esto se reutiliza
+MAX_STALE_S = 10.0        # un snapshot más viejo que esto NO se sirve (evita aviones fantasma)
+MAX_POS_AGE_S = 15.0      # fixes más viejos que esto se descartan (ADS-C, MLAT perdido, etc.)
+REFRESH_EVERY_S = 1.0     # cadencia del refresco en segundo plano (límite de airplanes.live: 1 req/s)
+ACTIVE_WINDOW_S = 30.0
+
 HTTP_SESSION = requests.Session()
+CACHE = {}
+LAST_REQ = {}
+CELL_LOCKS = {}
+_STATE_LOCK = threading.Lock()
+_refresher_started = False
+
+def _cell_key(lat, lon):
+    return (round(lat / CELL_DEG), round(lon / CELL_DEG))
+
+def _fetch_snapshot(clat, clon):
+    empty = None
+    for name, tpl in UPSTREAMS:
+        try:
+            t0 = time.time()
+            r = HTTP_SESSION.get(tpl.format(lat=clat, lon=clon), headers=HTTP_HEADERS, timeout=(1.5, 2.5))
+            t1 = time.time()
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            ac = data.get('ac')
+            if not isinstance(ac, list):
+                continue
+            try:
+                api_now = float(data.get('now'))
+                if api_now > 1e11:
+                    api_now /= 1000.0
+            except (TypeError, ValueError):
+                api_now = None
+            # Referencia temporal: reloj de la API si es coherente con el nuestro; si no, punto medio de la petición
+            ref = api_now if (api_now and abs(api_now - t1) < 10.0) else (t0 + t1) / 2.0
+            ac = [a for a in ac if isinstance(a, dict)]
+            for a in ac:
+                try:
+                    sp = float(a.get('seen_pos', a.get('seen', 0.0)) or 0.0)
+                except (TypeError, ValueError):
+                    sp = 0.0
+                a['_pos_t'] = ref - max(0.0, sp)
+            snap = {'ac': ac, 'source': name, 'fetched': t1}
+            if ac:
+                return snap
+            if empty is None:
+                empty = snap
+        except Exception:
+            continue
+    return empty
+
+def _refresh_cell(key, block=True):
+    lock = CELL_LOCKS.setdefault(key, threading.Lock())
+    if not lock.acquire(blocking=block):
+        return CACHE.get(key)
+    try:
+        snap = CACHE.get(key)
+        if snap and time.time() - snap['fetched'] < FRESH_TTL_S:
+            return snap
+        new = _fetch_snapshot(key[0] * CELL_DEG, key[1] * CELL_DEG)
+        if new:
+            CACHE[key] = new
+            return new
+        return snap
+    finally:
+        lock.release()
+
+def _refresher_loop():
+    while True:
+        time.sleep(REFRESH_EVERY_S)
+        now = time.time()
+        for key, seen in list(LAST_REQ.items()):
+            if now - seen > 120.0:
+                LAST_REQ.pop(key, None)
+                CACHE.pop(key, None)
+            elif now - seen <= ACTIVE_WINDOW_S:
+                try:
+                    _refresh_cell(key)
+                except Exception:
+                    pass
+
+def _ensure_refresher():
+    global _refresher_started
+    if _refresher_started:
+        return
+    with _STATE_LOCK:
+        if not _refresher_started:
+            threading.Thread(target=_refresher_loop, daemon=True, name='adsb-refresh').start()
+            _refresher_started = True
 
 def get_live_aircraft(cur_lat, cur_lon):
-    now = time.time()
-    if now - CACHE['timestamp'] < 2.5 and abs(cur_lat - CACHE['lat']) < 0.05 and abs(cur_lon - CACHE['lon']) < 0.05:
-        return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
-
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/26.0'}
-    
-    # 1. airplanes.live
-    try:
-        url = f"https://api.airplanes.live/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
-        if r.status_code == 200:
-            data = r.json()
-            ac = data.get('ac', [])
-            if ac:
-                CACHE['lat'] = cur_lat
-                CACHE['lon'] = cur_lon
-                CACHE['timestamp'] = now
-                CACHE['aircraft'] = ac
-                CACHE['source'] = 'airplanes.live'
-                return ac, 'airplanes.live', 0.0
-    except Exception:
-        pass
-
-    # 2. adsb.lol fallback
-    try:
-        url = f"https://api.adsb.lol/v2/point/{cur_lat:.4f}/{cur_lon:.4f}/80"
-        r = HTTP_SESSION.get(url, headers=headers, timeout=2.5)
-        if r.status_code == 200:
-            data = r.json()
-            ac = data.get('ac', [])
-            if ac:
-                CACHE['lat'] = cur_lat
-                CACHE['lon'] = cur_lon
-                CACHE['timestamp'] = now
-                CACHE['aircraft'] = ac
-                CACHE['source'] = 'adsb.lol'
-                return ac, 'adsb.lol', 0.0
-    except Exception:
-        pass
-
-    return CACHE['aircraft'], CACHE['source'], max(0.0, now - CACHE['timestamp'])
+    _ensure_refresher()
+    key = _cell_key(cur_lat, cur_lon)
+    LAST_REQ[key] = time.time()
+    snap = CACHE.get(key)
+    if not snap or time.time() - snap['fetched'] >= FRESH_TTL_S:
+        snap = _refresh_cell(key, block=(snap is None))
+    if not snap:
+        return [], 'offline', 0.0
+    age = max(0.0, time.time() - snap['fetched'])
+    if age > MAX_STALE_S:
+        return [], snap['source'], age
+    return snap['ac'], snap['source'], age
 
 # =========================================================================
 # 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
@@ -174,11 +238,9 @@ def get_data():
         lon = float(request.args.get('lon', 2.2876))
         alt = float(request.args.get('alt', 145.0))
         user_lead_sec = max(0.0, min(15.0, float(request.args.get('lead', 6.0))))
-        now_epoch = time.time()
-
         raw_ac, source_feed, _ = get_live_aircraft(lat, lon)
-
-        t_now = ts.now()
+        now_epoch = time.time()  # instante único de referencia (aviones, astros y tca_epoch)
+        t_now = ts.from_datetime(datetime.fromtimestamp(now_epoch, timezone.utc))
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
         obs_loc = earth + topos_loc
         p_mbar, t_c = calculate_atmosphere(alt)
@@ -274,9 +336,10 @@ def get_data():
                 continue
 
             # Extrapolación de latencia calibrable
-            seen_pos = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
-            seen_pos = max(0.0, min(15.0, seen_pos))
-            total_lead = seen_pos + user_lead_sec
+            pos_age = max(0.0, now_epoch - ac.get('_pos_t', now_epoch))
+            if pos_age > MAX_POS_AGE_S:
+                continue
+            total_lead = pos_age + user_lead_sec
 
             if total_lead > 0.05:
                 ac_lat, ac_lon = propagate_geodetic_position(ac_lat, ac_lon, speed_ms, track_val, total_lead)
@@ -509,6 +572,16 @@ def get_data():
 # =========================================================================
 # 4. RUTAS DE INDEXACIÓN Y PLANTILLA HTML
 # =========================================================================
+@app.route('/api/time')
+def api_time():
+    return jsonify({'t': time.time()})
+
+@app.after_request
+def _no_store(resp):
+    if request.path.startswith('/api/'):
+        resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
 @app.route('/google92a4c5b46b2ec0bf.html')
 def google_verification():
     return 'google-site-verification: google92a4c5b46b2ec0bf.html'
@@ -532,6 +605,8 @@ HTML_TEMPLATE = r"""
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body { 
             background-color: #020617; 
@@ -646,86 +721,94 @@ HTML_TEMPLATE = r"""
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-track { background: #020617; }
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+
+        /* ===== TEMA PROFESIONAL v27 ===== */
+        :root{--bg:#070b12;--s1:#0c121d;--s2:#111a29;--line:rgba(148,163,184,.14);--line2:rgba(148,163,184,.28);--tx:#e6edf7;--mut:#8696ae;--moon:#7dd3fc;--sun:#fbbf24;--bad:#f87171;--ok:#34d399;--acc:#38bdf8}
+        html,body{background:var(--bg)}
+        body{color:var(--tx);font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
+        .font-mono,.tabular-nums{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+        [class*="text-[7.5px]"],[class*="text-[8px]"],[class*="text-[9px]"]{font-size:10px!important}
+        [class*="text-[9.5px]"],[class*="text-[10px]"]{font-size:11px!important}
+        .ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+        .topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-bottom:6px;background:var(--s1);border:1px solid var(--line);border-radius:12px}
+        .brand{display:flex;align-items:center;gap:10px}
+        .brand .brand-mark{width:28px;height:28px;color:var(--moon);stroke-width:1.5}
+        .brand h1{font-size:13px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;line-height:1.2}
+        .chips{display:flex;gap:4px;margin-top:4px}
+        .chip{font:600 10px/1 'JetBrains Mono',monospace;padding:3px 6px;border-radius:5px;border:1px solid var(--line2);color:var(--mut);background:rgba(255,255,255,.02);letter-spacing:.04em;white-space:nowrap}
+        #feed-badge{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
+        #feed-badge[data-state="bad"]{color:var(--bad);border-color:rgba(248,113,113,.4);background:rgba(248,113,113,.08)}
+        .bodies{display:flex;gap:6px}
+        .body-card{display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:10px;border:1px solid var(--line);background:var(--s2);cursor:pointer;opacity:.55;transition:.15s}
+        .body-card:hover{opacity:1}
+        .body-card.on{opacity:1}
+        #moon-status-card.on{border-color:rgba(125,211,252,.45)}
+        #sun-status-card.on{border-color:rgba(251,191,36,.45)}
+        .body-txt{display:flex;flex-direction:column;gap:2px}
+        .body-txt span{font:600 12px/1.2 'JetBrains Mono',monospace}
+        .body-txt small{font-size:10px;color:var(--mut);letter-spacing:.08em;text-transform:uppercase}
+        #moon-coords{color:var(--moon)} #sun-coords{color:var(--sun)}
+        .controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+        .stepper,.seg{display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line);border-radius:9px;background:var(--s2)}
+        .stepper .lbl{font-size:10px;font-weight:600;color:var(--mut);letter-spacing:.1em;padding:0 6px}
+        .stepper button,.seg button{min-width:26px;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600;color:var(--mut);transition:.12s}
+        .stepper button:hover,.seg button:hover{color:var(--tx);background:rgba(255,255,255,.05)}
+        .seg button.on{color:var(--tx);background:rgba(56,189,248,.16);box-shadow:inset 0 0 0 1px rgba(56,189,248,.4)}
+        #lead-display{min-width:54px;text-align:center;font:600 12px 'JetBrains Mono',monospace;color:var(--sun)}
+        .coords{font:500 11px 'JetBrains Mono',monospace;color:var(--mut)}
+        .icon-btn{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;border:1px solid var(--line);background:var(--s2);color:var(--mut);transition:.12s}
+        .icon-btn:hover{color:var(--tx);border-color:var(--line2)}
+        .icon-btn.on{color:var(--acc);border-color:rgba(56,189,248,.45);background:rgba(56,189,248,.1)}
+        .map-container{flex:1 1 auto;min-height:0;height:auto;width:100%}
+        .leaflet-container{background:#05080e!important;font-family:inherit}
+        .leaflet-bar a{background:var(--s1)!important;color:var(--tx)!important;border-color:var(--line)!important}
+        .leaflet-popup-content-wrapper,.leaflet-popup-tip{background:var(--s1);color:var(--tx);border:1px solid var(--line2);box-shadow:0 8px 24px rgba(0,0,0,.5)}
+        .leaflet-popup-content{margin:10px 12px;font:12px/1.55 'JetBrains Mono',monospace}
+        .leaflet-control-attribution{background:rgba(7,11,18,.7)!important;color:var(--mut)!important}
+        .avionics-panel{background:var(--s1);border:1px solid var(--line);box-shadow:none;backdrop-filter:none}
+        .hud-card{background:var(--s2);border:1px solid var(--line);border-radius:10px;backdrop-filter:none;contain:layout style}
+        .hud-card::before,.hud-card::after{display:none}
+        .hud-card:hover{transform:none;box-shadow:none;border-color:var(--line2)}
+        .glow-red{box-shadow:0 0 0 1px rgba(248,113,113,.55),0 0 22px rgba(248,113,113,.18)!important}
+        .glow-amber{box-shadow:0 0 0 1px rgba(245,158,11,.5),0 0 18px rgba(245,158,11,.14)!important}
+        .glow-cyan{box-shadow:none}
+        #settings-modal>div{background:var(--s1)!important;border-color:var(--line2)!important;border-radius:14px!important}
     </style>
 </head>
 <body class="p-1.5 md:p-2 flex flex-col h-[100dvh] overflow-hidden select-none">
     
-    <!-- CABINA SUPERIOR: TELEMETRÍA Y CONTROLES -->
-    <header class="avionics-panel px-3 py-1.5 rounded-xl mb-1.5 flex flex-wrap justify-between items-center gap-2 shadow-2xl">
-        
-        <!-- LOGO Y STATUS ENGINE -->
-        <div class="flex items-center gap-2">
-            <span class="text-2xl animate-pulse">🌔</span>
+    <header class="topbar">
+        <div class="brand">
+            <svg class="ic brand-mark" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M2.5 15.5 21.5 8.5"/></svg>
             <div>
-                <h1 class="text-xs font-black text-amber-400 tracking-wider">LUNAR RADAR PRO</h1>
-                <div class="flex items-center gap-1 font-mono text-[8px]">
-                    <span id="feed-badge" class="px-1 py-0.2 bg-emerald-950 text-emerald-300 border border-emerald-700/80 rounded font-bold">ONLINE</span>
-                    <span class="px-1 py-0.2 bg-indigo-950 text-indigo-300 border border-indigo-700/80 rounded font-mono">DE421 JPL</span>
-                </div>
+                <h1>Lunar Transit Radar</h1>
+                <div class="chips"><span id="feed-badge" class="chip">ONLINE</span><span class="chip">DE421 JPL</span><span id="sync-badge" class="chip">SYNC …</span></div>
             </div>
         </div>
-        
-        <!-- TARJETAS DE CUERPOS CELESTES CON GLOW DINÁMICO -->
-        <div class="flex items-center gap-1.5 text-xs">
-            <div id="moon-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer hover:border-cyan-400 transition glow-cyan ring-1 ring-cyan-400/50" onclick="setFilterMode('moon')">
+        <div class="bodies">
+            <div id="moon-status-card" class="body-card on" onclick="setFilterMode('moon')">
                 <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
-                <div class="flex flex-col">
-                    <span id="moon-coords" class="text-cyan-300 font-bold text-[11px] leading-tight tabular-nums">Moon: Az --° | Alt --°</span>
-                    <span class="text-[8px] text-slate-400 font-mono tracking-wider">OPTICAL VECTOR LOCK</span>
-                </div>
-                <span id="moon-badge" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 text-cyan-400 rounded border border-cyan-800 font-mono font-bold tabular-nums">--:--</span>
+                <div class="body-txt"><span id="moon-coords">Moon: Az --° | Alt --°</span><small>Moon · optical vector</small></div>
+                <span id="moon-badge" class="chip">--:--</span>
             </div>
-
-            <div id="sun-status-card" class="bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-amber-400 transition" onclick="setFilterMode('sun')">
+            <div id="sun-status-card" class="body-card" onclick="setFilterMode('sun')">
                 <div id="header-sun-icon" class="w-5 h-5 flex items-center justify-center"></div>
-                <div class="flex flex-col">
-                    <span id="sun-coords" class="text-amber-300 font-bold text-[11px] leading-tight tabular-nums">Sun: Az --° | Alt --°</span>
-                    <span class="text-[8px] text-slate-400 font-mono tracking-wider">SOLAR SIGHT LINE</span>
-                </div>
-                <span id="sun-badge" class="text-[9px] px-1.5 py-0.5 bg-amber-950 text-amber-400 rounded border border-amber-800 font-mono font-bold tabular-nums">--:--</span>
-            </div>
-
-            <div class="hidden sm:flex bg-slate-950/90 px-2 py-1 rounded-lg border border-slate-800 items-center gap-1.5">
-                <span id="obs-coords" class="text-cyan-400 font-bold text-[11px] tabular-nums">41.6079, 2.2876</span>
-                <span id="obs-alt-badge" class="text-emerald-300 font-bold text-[11px] tabular-nums">⛰️ 145m</span>
-                <button id="lock-btn" onclick="toggleLocationLock()" class="text-[10px] px-1 bg-slate-900 hover:bg-slate-800 text-slate-300 rounded border border-slate-700 font-bold transition">
-                    🔒
-                </button>
+                <div class="body-txt"><span id="sun-coords">Sun: Az --° | Alt --°</span><small>Sun · solar sight line</small></div>
+                <span id="sun-badge" class="chip">--:--</span>
             </div>
         </div>
-
-        <!-- CONTROL DE SINCRONIZACIÓN DE LATENCIA (LEAD SYNC) -->
-        <div class="flex items-center gap-1 bg-slate-950 px-2 py-1 rounded-lg border border-slate-800">
-            <span class="text-[9px] text-slate-400 font-bold tracking-wider">⚡ LEAD:</span>
-            <button onclick="adjustLead(-0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs transition active:scale-95">-</button>
-            <span id="lead-display" class="font-mono text-xs font-black text-amber-400 min-w-[46px] text-center tabular-nums">+6.0s</span>
-            <button onclick="adjustLead(0.5)" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 font-bold rounded text-xs transition active:scale-95">+</button>
-        </div>
-
-        <!-- SELECTOR DE FILTROS MOON / SUN / DUAL -->
-        <div class="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
-            <button id="btn-flt-moon" onclick="setFilterMode('moon')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_10px_rgba(6,182,212,0.4)]">🌔 Moon</button>
-            <button id="btn-flt-sun" onclick="setFilterMode('sun')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-amber-300">☀️ Sun</button>
-            <button id="btn-flt-all" onclick="setFilterMode('all')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-white">Dual</button>
-        </div>
-
-        <!-- CONMUTADOR: MAPA TÁCTICO VS TERMINAL HARVARD -->
-        <div class="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
-            <button id="view-map-btn" onclick="setViewMode('map')" class="text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800">
-                🗺️ Map
-            </button>
-            <button id="view-terminal-btn" onclick="setViewMode('terminal')" class="text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1">
-                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
-                💻 Terminal
-            </button>
-        </div>
-
-        <!-- HERRAMIENTAS Y AUDIO ACTIVADOS POR DEFECTO -->
-        <div class="flex items-center gap-1">
-            <button id="voice-btn" onclick="toggleVoice()" class="bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition shadow-[0_0_10px_rgba(168,85,247,0.4)]" title="Voz activada">🗣️</button>
-            <button id="audio-btn" onclick="toggleAudio()" class="bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition shadow-[0_0_10px_rgba(16,185,129,0.4)]" title="Sonido activado">🔔</button>
-            <button onclick="toggleSettingsModal()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold transition">⚙️</button>
-            <button onclick="locateUser()" class="bg-cyan-600 hover:bg-cyan-500 text-white text-xs px-2.5 py-1.5 rounded-lg font-bold transition shadow-lg shadow-cyan-600/30">📍</button>
+        <div class="controls">
+            <div class="stepper"><span class="lbl">LEAD</span><button onclick="adjustLead(-0.5)">−</button><span id="lead-display">+6.0s</span><button onclick="adjustLead(0.5)">+</button></div>
+            <div class="seg">
+                <button id="btn-flt-moon" class="on" onclick="setFilterMode('moon')">Moon</button>
+                <button id="btn-flt-sun" onclick="setFilterMode('sun')">Sun</button>
+                <button id="btn-flt-all" onclick="setFilterMode('all')">Dual</button>
+            </div>
+            <div class="hidden md:flex flex-col items-end leading-tight"><span id="obs-coords" class="coords">41.6079, 2.2876</span><span id="obs-alt-badge" class="coords">145 m ASL</span></div>
+            <button id="voice-btn" class="icon-btn on" onclick="toggleVoice()" title="Voz"><svg class="ic" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
+            <button id="audio-btn" class="icon-btn on" onclick="toggleAudio()" title="Sonido"><svg class="ic" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/></svg></button>
+            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg></button>
+            <button class="icon-btn" onclick="locateUser()" title="Mi ubicación"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3"/></svg></button>
         </div>
     </header>
 
@@ -747,32 +830,8 @@ HTML_TEMPLATE = r"""
             </div>
 
             <div class="absolute bottom-2.5 left-2.5 z-[1000] bg-slate-950/90 backdrop-blur px-2.5 py-1.5 rounded-lg text-[11px] border border-slate-800 text-slate-300 flex items-center gap-2">
-                <span id="footer-vector-indicator" class="font-bold text-cyan-400">🌕──────</span>
+                <span id="footer-vector-indicator" class="font-bold text-cyan-400">━━━━</span>
                 <span id="footer-astro-info">Optical Sight Vector Active</span>
-            </div>
-        </div>
-
-        <!-- VISTA 2: HARVARD ASTRO-TERMINAL -->
-        <div id="terminal-viewport" class="lg:col-span-3 rounded-xl overflow-hidden border border-emerald-900/60 relative shadow-2xl flex flex-col hidden terminal-screen">
-            <div class="bg-slate-950 px-3 py-2 border-b border-emerald-900/50 flex justify-between items-center text-xs">
-                <div class="flex items-center gap-2">
-                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span class="font-bold text-emerald-400 font-mono tracking-wider">HARVARD CENTER FOR ASTROPHYSICS // ASTRO-RADAR KERNEL DE421</span>
-                </div>
-                <div class="flex items-center gap-2">
-                    <button id="term-pause-btn" onclick="toggleTerminalPause()" class="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]">⏸ Pause</button>
-                    <button onclick="clearTerminal()" class="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]">Clear</button>
-                    <button onclick="copyTerminal()" class="px-2 py-0.5 bg-emerald-950 text-emerald-300 border border-emerald-800 rounded text-[10px]">Copy Buffer</button>
-                </div>
-            </div>
-            
-            <div id="terminal-output" class="p-3 font-mono text-[11px] text-emerald-400/90 overflow-y-auto flex-grow flex flex-col gap-1 leading-relaxed selection:bg-emerald-900 selection:text-white">
-                <div class="text-slate-500">// HARVARD ASTRO-KERNEL INITIALIZED. REAL-TIME ASTRODYNAMICS TELEMETRY ACTIVE.</div>
-            </div>
-
-            <div class="bg-slate-950/90 border-t border-emerald-900/40 p-2 flex justify-between items-center text-[10px] text-slate-400 font-mono">
-                <span>MATRICES: WGS84 ECEF &bull; ENU &bull; GSS RES: &plusmn;3ms</span>
-                <span id="terminal-clock" class="text-emerald-400 font-bold tabular-nums">2026-09-25 00:00:00 UTC</span>
             </div>
         </div>
 
@@ -780,10 +839,10 @@ HTML_TEMPLATE = r"""
         <div class="avionics-panel rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 shadow-2xl max-h-[42vh] lg:max-h-full">
             <div class="flex justify-between items-center border-b border-slate-800 pb-1.5">
                 <h2 class="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                    <span>📡 SECTOR TELEMETRY</span>
+                    <span>Sector telemetry</span>
                     <span id="plane-count" class="bg-cyan-950 text-cyan-300 px-1.5 py-0.2 rounded-full text-[9px] border border-cyan-800 font-mono tabular-nums">0</span>
                 </h2>
-                <span id="filter-indicator" class="text-[9px] text-cyan-400 font-mono font-bold tracking-wider">TARGET: 🌕 MOON</span>
+                <span id="filter-indicator" class="text-[9px] text-cyan-400 font-mono font-bold tracking-wider">TARGET · MOON</span>
             </div>
             
             <div id="alerts-container" class="flex flex-col gap-2 overflow-y-auto">
@@ -857,7 +916,6 @@ HTML_TEMPLATE = r"""
 
         let activeFilter = 'moon';
         let viewMode = 'map';
-        let terminalPaused = false;
         let isLocationLocked = true;
         let serverClockDelta = 0.0;
         
@@ -950,45 +1008,6 @@ HTML_TEMPLATE = r"""
             document.getElementById('lead-display').innerText = (userLeadSec >= 0 ? '+' : '') + userLeadSec.toFixed(1) + 's';
         }
 
-        function setViewMode(mode) {
-            viewMode = mode;
-            const mapV = document.getElementById('radar-viewport');
-            const termV = document.getElementById('terminal-viewport');
-            const mapB = document.getElementById('view-map-btn');
-            const termB = document.getElementById('view-terminal-btn');
-
-            if (mode === 'map') {
-                mapV.classList.remove('hidden');
-                termV.classList.add('hidden');
-                mapB.className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_10px_rgba(6,182,212,0.3)]";
-                termB.className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-emerald-400 flex items-center gap-1";
-                map.invalidateSize();
-            } else {
-                mapV.classList.add('hidden');
-                termV.classList.remove('hidden');
-                termB.className = "text-[10px] px-2.5 py-1 rounded font-bold bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-1 shadow-[0_0_10px_rgba(16,185,129,0.3)]";
-                mapB.className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-cyan-300";
-            }
-        }
-
-        function toggleTerminalPause() {
-            terminalPaused = !terminalPaused;
-            const btn = document.getElementById('term-pause-btn');
-            btn.innerText = terminalPaused ? "▶ Resume" : "⏸ Pause";
-            btn.className = terminalPaused 
-                ? "px-2 py-0.5 bg-amber-950 text-amber-300 border border-amber-800 rounded text-[10px] font-bold"
-                : "px-2 py-0.5 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded text-[10px]";
-        }
-
-        function clearTerminal() {
-            document.getElementById('terminal-output').innerHTML = '<div class="text-slate-500">// BUFFER CLEARED. LISTENING TO KERNEL DATA...</div>';
-        }
-
-        function copyTerminal() {
-            const txt = document.getElementById('terminal-output').innerText;
-            navigator.clipboard.writeText(txt);
-        }
-
         function drawRangeRings() {
             rangeCircles.forEach(c => map.removeLayer(c));
             rangeCircles = [];
@@ -1040,57 +1059,20 @@ HTML_TEMPLATE = r"""
 
         function setFilterMode(mode) {
             activeFilter = mode;
-            ['btn-flt-moon', 'btn-flt-sun', 'btn-flt-all'].forEach(id => {
-                document.getElementById(id).className = "text-[10px] px-2.5 py-1 rounded font-bold text-slate-400 hover:text-white";
-            });
-
-            const moonCard = document.getElementById('moon-status-card');
-            const sunCard = document.getElementById('sun-status-card');
-            const footerInd = document.getElementById('footer-vector-indicator');
-            const footerInfo = document.getElementById('footer-astro-info');
-
-            if (mode === 'moon') {
-                document.getElementById('btn-flt-moon').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-cyan-950 text-cyan-300 border border-cyan-800 shadow-[0_0_12px_rgba(6,182,212,0.4)]";
-                document.getElementById('filter-indicator').innerText = "TARGET: 🌕 MOON";
-                if (moonCard) {
-                    moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-500 flex items-center gap-2 cursor-pointer transition glow-cyan ring-1 ring-cyan-400/50";
-                }
-                if (sunCard) {
-                    sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-amber-400 transition";
-                }
-                footerInd.innerHTML = `<span class="text-cyan-400 font-bold">🌕──────</span>`;
-                footerInfo.innerText = "Optical Sight Line to the Moon";
-            } else if (mode === 'sun') {
-                document.getElementById('btn-flt-sun').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-amber-950 text-amber-300 border border-amber-800 shadow-[0_0_12px_rgba(245,158,11,0.4)]";
-                document.getElementById('filter-indicator').innerText = "TARGET: ☀️ SUN";
-                if (sunCard) {
-                    sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-500 flex items-center gap-2 cursor-pointer transition glow-amber ring-1 ring-amber-400/50";
-                }
-                if (moonCard) {
-                    moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-slate-800 flex items-center gap-2 cursor-pointer opacity-70 hover:opacity-100 hover:border-cyan-400 transition";
-                }
-                footerInd.innerHTML = `<span class="text-amber-400 font-bold">☀️──────</span>`;
-                footerInfo.innerText = "Optical Sight Line to the Sun";
-            } else {
-                document.getElementById('btn-flt-all').className = "text-[10px] px-2.5 py-1 rounded font-bold bg-slate-800 text-cyan-300 border border-slate-600 shadow-[0_0_10px_rgba(6,182,212,0.2)]";
-                document.getElementById('filter-indicator').innerText = "TARGET: DUAL (SUN & MOON)";
-                if (moonCard) {
-                    moonCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-cyan-800 flex items-center gap-2 cursor-pointer transition glow-cyan";
-                }
-                if (sunCard) {
-                    sunCard.className = "bg-slate-950/90 px-2.5 py-1 rounded-lg border border-amber-800 flex items-center gap-2 cursor-pointer transition glow-amber";
-                }
-                footerInd.innerHTML = `<span class="text-cyan-400 font-bold">🌕──</span> <span class="text-amber-400 font-bold">☀️──</span>`;
-                footerInfo.innerText = "Dual Optical Sight Lines Active";
-            }
+            ['moon', 'sun', 'all'].forEach(m => document.getElementById('btn-flt-' + m).classList.toggle('on', m === mode));
+            document.getElementById('moon-status-card').classList.toggle('on', mode !== 'sun');
+            document.getElementById('sun-status-card').classList.toggle('on', mode !== 'moon');
+            document.getElementById('filter-indicator').innerText = { moon: 'TARGET · MOON', sun: 'TARGET · SUN', all: 'TARGET · DUAL' }[mode];
+            const ind = document.getElementById('footer-vector-indicator');
+            ind.className = 'font-bold ' + (mode === 'sun' ? 'text-amber-400' : 'text-cyan-400');
+            document.getElementById('footer-astro-info').innerText = { moon: 'Optical sight line · Moon', sun: 'Optical sight line · Sun', all: 'Dual optical sight lines' }[mode];
             renderAstroVectors();
             updateHUDCountdowns();
         }
 
         function toggleVoice() {
             voiceEnabled = !voiceEnabled;
-            const btn = document.getElementById('voice-btn');
-            btn.className = voiceEnabled ? "bg-purple-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold transition shadow-[0_0_10px_rgba(168,85,247,0.4)]" : "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
+            document.getElementById('voice-btn').classList.toggle('on', voiceEnabled);
             if (voiceEnabled) speak("Vocal radar active");
         }
 
@@ -1105,14 +1087,8 @@ HTML_TEMPLATE = r"""
 
         function toggleAudio() {
             audioEnabled = !audioEnabled;
-            const btn = document.getElementById('audio-btn');
-            if (audioEnabled) {
-                initAndUnlockAudio();
-                btn.innerText = "🔔"; btn.className = "bg-emerald-600 text-white text-xs px-2 py-1.5 rounded-lg font-bold shadow-[0_0_10px_rgba(16,185,129,0.4)]";
-                playChime();
-            } else {
-                btn.innerText = "🔇"; btn.className = "bg-slate-800 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-slate-700 font-bold";
-            }
+            document.getElementById('audio-btn').classList.toggle('on', audioEnabled);
+            if (audioEnabled) { initAndUnlockAudio(); playChime(); }
         }
 
         function playChime() {
@@ -1181,7 +1157,7 @@ HTML_TEMPLATE = r"""
         function updateAltitudeDisplay() {
             const totalAlt = Math.round(terrainElevationM + buildingOffsetM);
             const badge = document.getElementById('obs-alt-badge');
-            if (badge) badge.innerText = `⛰️ ${totalAlt}m`;
+            if (badge) badge.innerText = `${totalAlt} m ASL`;
 
             const tInput = document.getElementById('terrain-elevation-input');
             const bInput = document.getElementById('building-offset');
@@ -1335,156 +1311,159 @@ HTML_TEMPLATE = r"""
             }
         }
 
-        async function fetchData() {
-            try {
-                const totalObserverAlt = Math.round(terrainElevationM + buildingOffsetM);
-                const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}&lead=${userLeadSec}`);
-                const data = await res.json();
-                
-                if (data.server_time) {
-                    serverClockDelta = (Date.now() / 1000.0) - data.server_time;
-                }
-
-                moonDataGlobal = data.moon;
-                sunDataGlobal = data.sun;
-
-                if (data.source_feed) {
-                    document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
-                }
-
-                const mCoords = document.getElementById('moon-coords');
-                const mBadge = document.getElementById('moon-badge');
-                if (mCoords) mCoords.innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
-                if (mBadge) mBadge.innerText = `${moonDataGlobal.event_type}: ${moonDataGlobal.next_event_str}`;
-
-                const sCoords = document.getElementById('sun-coords');
-                const sBadge = document.getElementById('sun-badge');
-                if (sCoords) sCoords.innerText = sunDataGlobal.visible ? `Sun: Az ${sunDataGlobal.azimuth}° | Alt +${sunDataGlobal.elevation}°` : `Sun Hidden (${sunDataGlobal.elevation}°)`;
-                if (sBadge) sBadge.innerText = `${sunDataGlobal.event_type}: ${sunDataGlobal.next_event_str}`;
-
-                renderAstroVectors();
-
-                if (!terminalPaused) {
-                    const term = document.getElementById('terminal-output');
-                    const nowStr = new Date().toISOString().replace('T', ' ').slice(11, 23);
-                    
-                    const logEntry = document.createElement('div');
-                    logEntry.innerHTML = `[${nowStr}Z] <span class="text-cyan-400 font-bold">RADAR_KERNEL:</span> OBS=[${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}] | ALT=${totalObserverAlt}m | TARGETS=${data.aircraft ? data.aircraft.length : 0} | FEED=${data.source_feed} | LEAD=+${userLeadSec}s`;
-                    term.appendChild(logEntry);
-
-                    if (data.aircraft) {
-                        data.aircraft.slice(0, 3).forEach(p => {
-                            const target = p.primary;
-                            const subEntry = document.createElement('div');
-                            subEntry.className = "text-[10px] pl-4 text-emerald-400/80 font-mono";
-                            subEntry.innerHTML = `&bull; TGT:<b>${p.callsign}</b> (${p.model}) | FL${Math.round(p.alt_ft/100)} | DIST:${p.distance_km}km | SEP:${target.min_sep}° | TCA:${target.tca_seconds}s | CHORD:${target.position_descriptor}`;
-                            term.appendChild(subEntry);
-                        });
+        // ---------- Sincronización de reloj tipo NTP (muestra de menor RTT) ----------
+        let syncRtt = null;
+        async function syncClock(n = 5) {
+            if (syncRtt !== null) syncRtt *= 1.2;
+            for (let i = 0; i < n; i++) {
+                try {
+                    const t0 = Date.now() / 1000.0;
+                    const r = await fetch('/api/time?i=' + i, { cache: 'no-store' });
+                    const j = await r.json();
+                    const t1 = Date.now() / 1000.0;
+                    const rtt = t1 - t0;
+                    const off = (t0 + t1) / 2.0 - j.t;
+                    if (syncRtt === null || rtt <= syncRtt * 1.3 + 0.01) {
+                        serverClockDelta = (syncRtt === null) ? off : serverClockDelta * 0.6 + off * 0.4;
+                        syncRtt = (syncRtt === null) ? rtt : Math.min(rtt, syncRtt * 1.05);
                     }
+                } catch (e) {}
+                await new Promise(res => setTimeout(res, 120));
+            }
+            const b = document.getElementById('sync-badge');
+            if (b && syncRtt !== null) b.innerText = `SYNC ±${Math.max(1, Math.round(syncRtt * 500))}ms`;
+        }
+        const syncedNow = () => (Date.now() / 1000.0) - serverClockDelta;
 
-                    while (term.children.length > 150) term.removeChild(term.firstChild);
-                    term.scrollTop = term.scrollHeight;
-                    document.getElementById('terminal-clock').innerText = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-                }
-
-                activeAircraftData = data.aircraft || [];
-                document.getElementById('plane-count').innerText = activeAircraftData.length;
-                const currentCallsigns = new Set();
-                const nowSec = (Date.now() / 1000.0) - serverClockDelta;
-
-                activeAircraftData.forEach(plane => {
-                    const cs = plane.callsign;
-                    currentCallsigns.add(cs);
-
-                    const target = activeFilter === 'sun' ? plane.sun : (activeFilter === 'moon' ? plane.moon : plane.primary);
-
-                    if (tcaSmoothedEpochs[cs]) {
-                        const delta = target.tca_epoch - tcaSmoothedEpochs[cs];
-                        if (Math.abs(delta) < 2.0) {
-                            tcaSmoothedEpochs[cs] = tcaSmoothedEpochs[cs] * 0.75 + target.tca_epoch * 0.25;
-                        } else {
-                            tcaSmoothedEpochs[cs] = target.tca_epoch;
-                        }
-                    } else {
-                        tcaSmoothedEpochs[cs] = target.tca_epoch;
-                    }
-
-                    const color = getAltitudeColor(plane.alt_ft);
-                    const isAnyTransit = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
-                    const isAnyClose = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
-
-                    const glow = isAnyTransit ? 'filter: drop-shadow(0 0 10px #ef4444);' : (isAnyClose ? 'filter: drop-shadow(0 0 6px #f59e0b);' : '');
-
-                    const planeHtml = `
-                        <div style="transform: rotate(${plane.track}deg); width: 24px; height: 24px; display:flex; align-items:center; justify-content:center; ${glow}">
-                            <svg viewBox="0 0 24 24" width="22" height="22" fill="${color}">
-                                <path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/>
-                            </svg>
-                        </div>
-                    `;
-
-                    if (!planesState[cs]) {
-                        const marker = L.marker([plane.lat, plane.lon], {
-                            icon: L.divIcon({ className: '', html: planeHtml, iconSize: [24, 24], iconAnchor: [12, 12] })
-                        }).addTo(map);
-
-                        marker.bindPopup(`
-                            <div style="font-family: monospace; font-size: 11px; color:#000;">
-                                <b>VUELO:</b> ${plane.callsign} (${plane.model})<br>
-                                <b>REG:</b> ${plane.reg || 'N/A'}<br>
-                                <b>ALT:</b> ${plane.alt_ft.toLocaleString()} ft [${plane.alt_type}] (${plane.vr_fpm > 300 ? '↗' : (plane.vr_fpm < -300 ? '↘' : '→')} ${plane.vr_fpm} ft/m)<br>
-                                <b>VEL:</b> ${plane.speed_kt} kt | <b>DIST:</b> ${plane.distance_km} km<br>
-                                <b>ENVERGADURA:</b> ${plane.wingspan_m}m | <b>T. ANGULAR:</b> ${plane.moon.angular_size_arcsec}"<br>
-                                <b>RUMBO:</b> ${plane.track}°
-                            </div>
-                        `);
-
-                        planesState[cs] = {
-                            marker: marker,
-                            curLat: plane.lat, curLon: plane.lon,
-                            speedMs: plane.speed_ms,
-                            trackRad: (plane.track * Math.PI) / 180.0,
-                            lastSeenTime: nowSec,
-                            data: plane
-                        };
-                    } else {
-                        const st = planesState[cs];
-                        st.curLat = plane.lat;
-                        st.curLon = plane.lon;
-                        st.speedMs = plane.speed_ms;
-                        st.trackRad = (plane.track * Math.PI) / 180.0;
-                        st.lastSeenTime = nowSec;
-                        st.data = plane;
-                        st.marker.setIcon(L.divIcon({ className: '', html: planeHtml, iconSize: [24, 24], iconAnchor: [12, 12] }));
-                    }
-                });
-
-                for (let cs in planesState) {
-                    if (nowSec - planesState[cs].lastSeenTime > 12.0) {
-                        map.removeLayer(planesState[cs].marker);
-                        delete planesState[cs];
-                        delete tcaSmoothedEpochs[cs];
-                    }
-                }
-
-                updateHUDCountdowns();
-
-            } catch (err) {}
+        function projectLL(lat, lon, speedMs, trackRad, dt) {
+            const d = speedMs * dt;
+            return [lat + (d * Math.cos(trackRad)) / 111139.0,
+                    lon + (d * Math.sin(trackRad)) / (111139.0 * Math.cos(lat * Math.PI / 180.0))];
         }
 
+        function planeIconHtml(plane) {
+            const color = getAltitudeColor(plane.alt_ft);
+            const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
+            const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
+            const glow = anyT ? 'filter: drop-shadow(0 0 10px #ef4444);' : (anyC ? 'filter: drop-shadow(0 0 6px #f59e0b);' : '');
+            return `<div style="transform: rotate(${plane.track}deg); width: 24px; height: 24px; display:flex; align-items:center; justify-content:center; ${glow}">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="${color}"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg></div>`;
+        }
+
+        function popupHtml(p) {
+            const arrow = p.vr_fpm > 300 ? '▲' : (p.vr_fpm < -300 ? '▼' : '►');
+            return `<div><b style="color:#7dd3fc">${p.callsign}</b> · ${p.model}${p.reg ? ' · ' + p.reg : ''}<br>
+                ALT ${p.alt_ft.toLocaleString()} ft ${p.alt_type} ${arrow} ${p.vr_fpm} ft/m<br>
+                GS ${p.speed_kt} kt · HDG ${p.track}°<br>DIST ${p.distance_km} km · SPAN ${p.wingspan_m} m</div>`;
+        }
+
+        // ---------- Petición de datos: nunca solapada, nunca fuera de orden ----------
+        let fetchSeq = 0, appliedSeq = 0, fetchBusy = false, fetchQueued = false;
+        async function fetchData() {
+            if (fetchBusy) { fetchQueued = true; return; }
+            fetchBusy = true;
+            const seq = ++fetchSeq;
+            const ctl = new AbortController();
+            const to = setTimeout(() => ctl.abort(), 6000);
+            const feed = document.getElementById('feed-badge');
+            try {
+                const totalObserverAlt = Math.round(terrainElevationM + buildingOffsetM);
+                const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}&lead=${userLeadSec}`, { cache: 'no-store', signal: ctl.signal });
+                const data = await res.json();
+                if (seq < appliedSeq || data.error || !data.moon) return;
+                appliedSeq = seq;
+                feed.dataset.state = 'ok';
+                applyData(data);
+            } catch (err) {
+                feed.dataset.state = 'bad'; feed.innerText = 'RECONNECTING';
+            } finally {
+                clearTimeout(to);
+                fetchBusy = false;
+                if (fetchQueued) { fetchQueued = false; setTimeout(fetchData, 0); }
+            }
+        }
+
+        function applyData(data) {
+            moonDataGlobal = data.moon;
+            sunDataGlobal = data.sun;
+            if (data.source_feed) document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
+
+            const mCoords = document.getElementById('moon-coords');
+            const mBadge = document.getElementById('moon-badge');
+            mCoords.innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
+            mBadge.innerText = `${moonDataGlobal.event_type}: ${moonDataGlobal.next_event_str}`;
+            const sCoords = document.getElementById('sun-coords');
+            const sBadge = document.getElementById('sun-badge');
+            sCoords.innerText = sunDataGlobal.visible ? `Sun: Az ${sunDataGlobal.azimuth}° | Alt +${sunDataGlobal.elevation}°` : `Sun Hidden (${sunDataGlobal.elevation}°)`;
+            sBadge.innerText = `${sunDataGlobal.event_type}: ${sunDataGlobal.next_event_str}`;
+            renderAstroVectors();
+
+            activeAircraftData = data.aircraft || [];
+            document.getElementById('plane-count').innerText = activeAircraftData.length;
+            const tRef = data.server_time;      // instante al que corresponden lat/lon recibidos
+            const nowSec = syncedNow();
+            const seenKeys = new Set();
+
+            activeAircraftData.forEach(plane => {
+                const k = plane._k = plane.callsign + '|' + plane.reg;
+                seenKeys.add(k);
+                const target = activeFilter === 'sun' ? plane.sun : (activeFilter === 'moon' ? plane.moon : plane.primary);
+
+                // Suavizado mínimo del TCA: solo amortigua jitter < 0.3 s, nunca introduce retardo en cambios reales
+                const prev = tcaSmoothedEpochs[k], cur = target.tca_epoch;
+                tcaSmoothedEpochs[k] = (prev && Math.abs(cur - prev) < 0.3) ? prev * 0.5 + cur * 0.5 : cur;
+
+                const trackRad = (plane.track * Math.PI) / 180.0;
+                const sig = Math.round(plane.track) + '|' + getAltitudeColor(plane.alt_ft) + '|' + plane.moon.is_transit + plane.sun.is_transit + plane.moon.is_close + plane.sun.is_close;
+                const [pl, po] = projectLL(plane.lat, plane.lon, plane.speed_ms, trackRad, Math.max(-1, Math.min(8, nowSec - tRef)));
+                let st = planesState[k];
+
+                if (!st) {
+                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [24, 24], iconAnchor: [12, 12] }) }).addTo(map);
+                    marker.bindPopup(popupHtml(plane));
+                    st = planesState[k] = { marker, curLat: pl, curLon: po, errN: 0, errE: 0, iconSig: sig };
+                } else {
+                    // Corrección suave: el error entre lo dibujado y la nueva predicción decae en ~0.6 s (sin saltos)
+                    const eN = (st.curLat - pl) * 111139.0;
+                    const eE = (st.curLon - po) * 111139.0 * Math.cos(pl * Math.PI / 180.0);
+                    if (Math.hypot(eN, eE) < 1500) { st.errN = eN; st.errE = eE; } else { st.errN = 0; st.errE = 0; }
+                    if (st.iconSig !== sig) {
+                        st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [24, 24], iconAnchor: [12, 12] }));
+                        st.iconSig = sig;
+                    }
+                    st.marker.setPopupContent(popupHtml(plane));
+                }
+                st.baseLat = plane.lat; st.baseLon = plane.lon; st.tRef = tRef;
+                st.speedMs = plane.speed_ms; st.trackRad = trackRad;
+                st.lastSeen = nowSec; st.data = plane;
+            });
+
+            for (const k in planesState) {
+                if (!seenKeys.has(k) && nowSec - planesState[k].lastSeen > 6.0) {
+                    map.removeLayer(planesState[k].marker);
+                    delete planesState[k];
+                    delete tcaSmoothedEpochs[k];
+                }
+            }
+            updateHUDCountdowns();
+        }
+
+        // ---------- Animación: posición absoluta = base + v·(t_sync − t_ref), sin acumular deriva ----------
         let lastAnimTime = performance.now();
         function animateFrame(nowMs) {
-            const dt = Math.min(0.08, Math.max(0.001, (nowMs - lastAnimTime) / 1000.0));
+            const dtF = Math.min(0.1, Math.max(0.001, (nowMs - lastAnimTime) / 1000.0));
             lastAnimTime = nowMs;
-
-            for (const cs in planesState) {
-                const p = planesState[cs];
-                const dist = p.speedMs * dt;
-                p.curLat += (dist * Math.cos(p.trackRad)) / 111139.0;
-                p.curLon += (dist * Math.sin(p.trackRad)) / (111139.0 * Math.cos(p.curLat * Math.PI / 180.0));
+            const now = syncedNow();
+            const decay = Math.exp(-dtF / 0.6);
+            for (const k in planesState) {
+                const p = planesState[k];
+                if (p.baseLat === undefined) continue;
+                const [la, lo] = projectLL(p.baseLat, p.baseLon, p.speedMs, p.trackRad, Math.max(-1.0, Math.min(8.0, now - p.tRef)));
+                p.errN *= decay; p.errE *= decay;
+                p.curLat = la + p.errN / 111139.0;
+                p.curLon = lo + p.errE / (111139.0 * Math.cos(la * Math.PI / 180.0));
                 p.marker.setLatLng([p.curLat, p.curLon]);
             }
-
             requestAnimationFrame(animateFrame);
         }
 
@@ -1544,7 +1523,7 @@ HTML_TEMPLATE = r"""
 
             displayList.forEach(({ plane, target }) => {
                 const isTargetVisible = (target.target === 'sun' ? sunDataGlobal.visible : moonDataGlobal.visible);
-                const smoothedEpoch = tcaSmoothedEpochs[plane.callsign] || target.tca_epoch;
+                const smoothedEpoch = tcaSmoothedEpochs[plane._k] || target.tca_epoch;
                 const remaining = Math.max(0.0, smoothedEpoch - now);
 
                 const isTransit = target.is_transit && isTargetVisible;
@@ -1556,11 +1535,11 @@ HTML_TEMPLATE = r"""
                 const timerStr = remaining > 0 ? `T-${mins.toString().padStart(2, '0')}:${secs}` : `TRANSITING!`;
 
                 let cardBorder = 'border-slate-800/80 bg-slate-950/60';
-                let tagHtml = `<span class="bg-slate-900 text-slate-400 border border-slate-800 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">${sym} EN ROUTE</span>`;
+                let tagHtml = `<span class="bg-slate-900 text-slate-400 border border-slate-800 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">EN ROUTE</span>`;
 
                 if (isTransit) {
                     cardBorder = 'border-red-500/90 bg-red-950/60 glow-red';
-                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[8px] font-black font-mono tracking-wider animate-pulse">🎯 ${sym} TRANSIT LOCK</span>`;
+                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[8px] font-black font-mono tracking-wider animate-pulse">TRANSIT LOCK</span>`;
                     
                     if (!priorityTransitFound && remaining > 0) {
                         priorityTransitFound = true;
@@ -1600,7 +1579,7 @@ HTML_TEMPLATE = r"""
                     }
                 } else if (isClose) {
                     cardBorder = 'border-amber-500/80 bg-amber-950/50 glow-amber';
-                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">⚠️ ${sym} CLOSE PASS</span>`;
+                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">CLOSE PASS</span>`;
                     if (!priorityTransitFound && remaining > 0 && remaining < 180) {
                         priorityTransitFound = true;
                         renderTcaTrajectory(plane, target);
@@ -1608,7 +1587,7 @@ HTML_TEMPLATE = r"""
                 }
 
                 html += `
-                    <div onclick="focusPlane('${plane.callsign}')" 
+                    <div onclick="focusPlane('${plane._k}')" 
                          class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1.5 transition cursor-pointer hud-card">
                         
                         <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5 font-mono">
@@ -1697,9 +1676,11 @@ HTML_TEMPLATE = r"""
 
         updateAltitudeDisplay();
         drawRangeRings();
-        fetchData();
+        setFilterMode('moon');
+        syncClock(4).then(fetchData);
         fetchTerrainElevation(observerLat, observerLon);
-        setInterval(fetchData, 2500);
+        setInterval(fetchData, 1500);
+        setInterval(syncClock, 20000);
         setInterval(updateHUDCountdowns, 100);
         requestAnimationFrame(animateFrame);
     </script>
@@ -1710,7 +1691,7 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // AUDIO-DEFAULT & ALTITUDE ENGINE")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO v27 // TIMESTAMPED ADS-B INGEST")
     print(f" [OK] Audio & Voice Alerts: ACTIVE BY DEFAULT (Autoplay-Unlocked)")
     print(f" [OK] Dual Elevation Controller (Manual + Auto-Detect): ACTIVE")
     print(f" [OK] Server Online on port: {port}")
