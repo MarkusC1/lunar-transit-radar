@@ -125,7 +125,7 @@ PROVIDERS = [
 ]
 for _p in PROVIDERS:
     _p.update({'next_ok': 0.0, 'fails': 0, 'last_used': 0.0})
-HTTP_HEADERS = {'User-Agent': 'LunarTransitRadar/27 (personal, non-commercial transit planner)'}
+HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/27 (personal, non-commercial)', 'Accept': 'application/json'}
 CELL_DEG = 0.1             # rejilla (~11 km); el radio de 80 nm la cubre de sobra
 POLL_GAP_S = 1.2           # una petición global cada 1.2 s, rotando de proveedor
 MIN_PROVIDER_GAP_S = 2.0   # ningún proveedor recibe más de 1 petición cada 2 s
@@ -140,6 +140,7 @@ _POLL_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _poller_started = False
 _EVENT_CACHE = {}
+COLD_TRY = {}
 
 def _cell_key(lat, lon):
     return (round(lat / CELL_DEG), round(lon / CELL_DEG))
@@ -150,12 +151,13 @@ def _fetch_provider(p, clat, clon):
         t0 = time.time()
         r = HTTP_SESSION.get(p['url'].format(lat=clat, lon=clon), headers=HTTP_HEADERS, timeout=(1.5, 3.0))
         t1 = time.time()
+        p['last'] = f'HTTP {r.status_code}'
         if r.status_code != 200:
             try:
                 ra = float(r.headers.get('Retry-After', 0))
             except (TypeError, ValueError):
                 ra = 0.0
-            return None, (ra if ra > 0 else (30.0 if r.status_code == 403 else 0.0))
+            return None, (ra if ra > 0 else (15.0 if r.status_code == 403 else 0.0))
         data = r.json()
         ac = data.get('ac')
         if not isinstance(ac, list):
@@ -174,8 +176,10 @@ def _fetch_provider(p, clat, clon):
             except (TypeError, ValueError):
                 sp = 0.0
             a['_pos_t'] = ref - max(0.0, sp)
+        p['last'] = f'ok · {len(ac)} ac'
         return {'ac': ac, 'source': p['name'], 'fetched': t1}, 0.0
-    except Exception:
+    except Exception as e:
+        p['last'] = type(e).__name__
         return None, 0.0
 
 def _poll_cell(key):
@@ -241,16 +245,25 @@ def _merge(ent, now):
                 best[h] = a
     return list(best.values()), newest
 
+def feed_status():
+    now = time.time()
+    return [{'name': p['name'], 'last': p.get('last', 'sin intentos'), 'fails': p['fails'],
+             'cooldown_s': round(max(0.0, p['next_ok'] - now), 1)} for p in PROVIDERS]
+
+def _feed_note():
+    return '; '.join(f"{p['name']}: {p.get('last', '?')}" for p in PROVIDERS if p['fails'])
+
 def get_live_aircraft(cur_lat, cur_lon):
     _ensure_poller()
     key = _cell_key(cur_lat, cur_lon)
     LAST_REQ[key] = time.time()
     ent = CELLS.get(key)
-    if not ent or not ent['snaps']:                  # arranque en frío: único caso en que se espera al upstream
-        for _ in range(4):
+    if (not ent or not ent['snaps']) and time.time() - COLD_TRY.get(key, 0.0) > 4.0:
+        COLD_TRY[key] = time.time()                  # arranque en frío: único caso en que se espera al upstream
+        for _ in range(3):
             if _poll_cell(key):
                 break
-            time.sleep(0.5)
+            time.sleep(0.4)
         ent = CELLS.get(key)
     if not ent:
         return [], 'offline', 0.0
@@ -592,6 +605,7 @@ def get_data():
         return jsonify({
             'source_feed': source_feed,
             'feed_age_s': round(feed_age, 2),
+            'feed_note': _feed_note(),
             'server_time': now_epoch,
             'lead_used_sec': round(user_lead_sec, 1),
             'observer_altitude_used_m': alt,
@@ -616,6 +630,12 @@ def get_data():
 # =========================================================================
 # 4. RUTAS DE INDEXACIÓN Y PLANTILLA HTML
 # =========================================================================
+@app.route('/api/status')
+def api_status():
+    now = time.time()
+    cells = {f'{k[0]*CELL_DEG:.1f},{k[1]*CELL_DEG:.1f}': {n: {'aircraft': len(s['ac']), 'age_s': round(now - s['fetched'], 1)} for n, s in e['snaps'].items()} for k, e in CELLS.items()}
+    return jsonify({'providers': feed_status(), 'cells': cells})
+
 @app.route('/api/time')
 def api_time():
     return jsonify({'t': time.time()})
@@ -1460,6 +1480,7 @@ HTML_TEMPLATE = r"""
         }
 
         // ---------- Petición de datos: nunca solapada, nunca fuera de orden ----------
+        let feedNote = '';
         let fetchSeq = 0, appliedSeq = 0, fetchBusy = false, fetchQueued = false;
         async function fetchData() {
             if (fetchBusy) { fetchQueued = true; return; }
@@ -1472,7 +1493,11 @@ HTML_TEMPLATE = r"""
                 const totalObserverAlt = Math.round(terrainElevationM + buildingOffsetM);
                 const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}&lead=${userLeadSec}`, { cache: 'no-store', signal: ctl.signal });
                 const data = await res.json();
-                if (seq < appliedSeq || data.error || !data.moon) return;
+                if (data.error || !data.moon) {
+                    feedNote = 'error de servidor: ' + (data.error || 'respuesta vacía');
+                    feed.dataset.state = 'bad'; feed.innerText = 'SERVER ERROR'; updateHUDCountdowns(); return;
+                }
+                if (seq < appliedSeq) return;
                 appliedSeq = seq;
                 feed.dataset.state = 'ok';
                 applyData(data);
@@ -1488,6 +1513,7 @@ HTML_TEMPLATE = r"""
         function applyData(data) {
             moonDataGlobal = data.moon;
             sunDataGlobal = data.sun;
+            feedNote = data.feed_note || '';
             const fb = document.getElementById('feed-badge'), fa = data.feed_age_s;
             fb.innerText = (data.source_feed || 'FEED').toUpperCase() + (fa !== undefined ? ` · ${fa.toFixed(1)}s` : '');
             fb.dataset.state = (fa !== undefined && fa > 8) ? 'bad' : 'ok';
@@ -1606,7 +1632,7 @@ HTML_TEMPLATE = r"""
         function updateHUDCountdowns() {
             const container = document.getElementById('alerts-container');
             if (!activeAircraftData || activeAircraftData.length === 0) {
-                container.innerHTML = '<div class="text-xs text-slate-500 text-center py-8 font-mono">Scanning airspace for transit intercept...</div>';
+                container.innerHTML = `<div class="text-xs text-slate-500 text-center py-8 font-mono">${feedNote ? 'Sin datos ADS-B · ' + feedNote + '<br><span class="text-slate-600">Detalle en /api/status</span>' : 'Scanning airspace for transit intercept...'}</div>`;
                 clearTcaTrajectory();
                 return;
             }
