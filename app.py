@@ -111,122 +111,154 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. INGESTA ADS-B CON TIEMPO EXACTO POR POSICIÓN
-#    Cada posición lleva su instante real de medida (_pos_t = now_API - seen_pos).
-#    La edad se calcula en el momento del cálculo, así que caché, latencia de red
-#    y reutilización de snapshots quedan compensadas automáticamente.
+# 2. INGESTA ADS-B: 3 FUENTES, RITMO EDUCADO Y TIEMPO EXACTO POR POSICIÓN
+#    Las tres APIs limitan a 1 req/s (airplanes.live, adsb.fi) o de forma dinámica
+#    (adsb.lol) y no dan SLA. Render comparte IP de centro de datos, así que se
+#    trabaja MUY por debajo del límite, con enfriamiento tras 429/403/5xx.
+#    Ninguna petición de usuario toca el upstream salvo el arranque en frío.
+#    Datos: airplanes.live · adsb.lol · adsb.fi (uso personal, no comercial).
 # =========================================================================
-UPSTREAMS = (
-    ('airplanes.live', 'https://api.airplanes.live/v2/point/{lat:.4f}/{lon:.4f}/80'),
-    ('adsb.lol', 'https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/80'),
-)
-HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/27.0'}
-CELL_DEG = 0.1            # rejilla de caché (~11 km) compartida entre usuarios; el radio de 80 nm lo cubre de sobra
-FRESH_TTL_S = 0.9         # un snapshot más joven que esto se reutiliza
-MAX_STALE_S = 10.0        # un snapshot más viejo que esto NO se sirve (evita aviones fantasma)
-MAX_POS_AGE_S = 15.0      # fixes más viejos que esto se descartan (ADS-C, MLAT perdido, etc.)
-REFRESH_EVERY_S = 1.0     # cadencia del refresco en segundo plano (límite de airplanes.live: 1 req/s)
+PROVIDERS = [
+    {'name': 'airplanes.live', 'url': 'https://api.airplanes.live/v2/point/{lat:.4f}/{lon:.4f}/80'},
+    {'name': 'adsb.lol', 'url': 'https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/80'},
+    {'name': 'adsb.fi', 'url': 'https://opendata.adsb.fi/api/v2/lat/{lat:.4f}/lon/{lon:.4f}/dist/80'},
+]
+for _p in PROVIDERS:
+    _p.update({'next_ok': 0.0, 'fails': 0, 'last_used': 0.0})
+HTTP_HEADERS = {'User-Agent': 'LunarTransitRadar/27 (personal, non-commercial transit planner)'}
+CELL_DEG = 0.1             # rejilla (~11 km); el radio de 80 nm la cubre de sobra
+POLL_GAP_S = 1.2           # una petición global cada 1.2 s, rotando de proveedor
+MIN_PROVIDER_GAP_S = 2.0   # ningún proveedor recibe más de 1 petición cada 2 s
+MAX_STALE_S = 20.0         # un snapshot más viejo no se usa
+MAX_POS_AGE_S = 20.0       # un fix más viejo se descarta (ADS-C, cobertura perdida)
 ACTIVE_WINDOW_S = 30.0
 
 HTTP_SESSION = requests.Session()
-CACHE = {}
+CELLS = {}
 LAST_REQ = {}
-CELL_LOCKS = {}
+_POLL_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
-_refresher_started = False
+_poller_started = False
+_EVENT_CACHE = {}
 
 def _cell_key(lat, lon):
     return (round(lat / CELL_DEG), round(lon / CELL_DEG))
 
-def _fetch_snapshot(clat, clon):
-    empty = None
-    for name, tpl in UPSTREAMS:
-        try:
-            t0 = time.time()
-            r = HTTP_SESSION.get(tpl.format(lat=clat, lon=clon), headers=HTTP_HEADERS, timeout=(1.5, 2.5))
-            t1 = time.time()
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            ac = data.get('ac')
-            if not isinstance(ac, list):
-                continue
-            try:
-                api_now = float(data.get('now'))
-                if api_now > 1e11:
-                    api_now /= 1000.0
-            except (TypeError, ValueError):
-                api_now = None
-            # Referencia temporal: reloj de la API si es coherente con el nuestro; si no, punto medio de la petición
-            ref = api_now if (api_now and abs(api_now - t1) < 10.0) else (t0 + t1) / 2.0
-            ac = [a for a in ac if isinstance(a, dict)]
-            for a in ac:
-                try:
-                    sp = float(a.get('seen_pos', a.get('seen', 0.0)) or 0.0)
-                except (TypeError, ValueError):
-                    sp = 0.0
-                a['_pos_t'] = ref - max(0.0, sp)
-            snap = {'ac': ac, 'source': name, 'fetched': t1}
-            if ac:
-                return snap
-            if empty is None:
-                empty = snap
-        except Exception:
-            continue
-    return empty
-
-def _refresh_cell(key, block=True):
-    lock = CELL_LOCKS.setdefault(key, threading.Lock())
-    if not lock.acquire(blocking=block):
-        return CACHE.get(key)
+def _fetch_provider(p, clat, clon):
+    """Devuelve (snapshot|None, retry_after_s). Cada aeronave lleva _pos_t = instante real del fix."""
     try:
-        snap = CACHE.get(key)
-        if snap and time.time() - snap['fetched'] < FRESH_TTL_S:
-            return snap
-        new = _fetch_snapshot(key[0] * CELL_DEG, key[1] * CELL_DEG)
-        if new:
-            CACHE[key] = new
-            return new
-        return snap
-    finally:
-        lock.release()
+        t0 = time.time()
+        r = HTTP_SESSION.get(p['url'].format(lat=clat, lon=clon), headers=HTTP_HEADERS, timeout=(1.5, 3.0))
+        t1 = time.time()
+        if r.status_code != 200:
+            try:
+                ra = float(r.headers.get('Retry-After', 0))
+            except (TypeError, ValueError):
+                ra = 0.0
+            return None, (ra if ra > 0 else (30.0 if r.status_code == 403 else 0.0))
+        data = r.json()
+        ac = data.get('ac')
+        if not isinstance(ac, list):
+            return None, 0.0
+        try:
+            api_now = float(data.get('now'))
+            if api_now > 1e11:
+                api_now /= 1000.0
+        except (TypeError, ValueError):
+            api_now = None
+        ref = api_now if (api_now and abs(api_now - t1) < 10.0) else (t0 + t1) / 2.0
+        ac = [a for a in ac if isinstance(a, dict)]
+        for a in ac:
+            try:
+                sp = float(a.get('seen_pos', a.get('seen', 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                sp = 0.0
+            a['_pos_t'] = ref - max(0.0, sp)
+        return {'ac': ac, 'source': p['name'], 'fetched': t1}, 0.0
+    except Exception:
+        return None, 0.0
 
-def _refresher_loop():
-    while True:
-        time.sleep(REFRESH_EVERY_S)
+def _poll_cell(key):
+    with _POLL_LOCK:
         now = time.time()
-        for key, seen in list(LAST_REQ.items()):
-            if now - seen > 120.0:
-                LAST_REQ.pop(key, None)
-                CACHE.pop(key, None)
-            elif now - seen <= ACTIVE_WINDOW_S:
-                try:
-                    _refresh_cell(key)
-                except Exception:
-                    pass
+        ready = [p for p in PROVIDERS if p['next_ok'] <= now]
+        if not ready:
+            return None
+        p = min(ready, key=lambda x: x['last_used'])
+        p['last_used'] = now
+        p['next_ok'] = now + MIN_PROVIDER_GAP_S
+        snap, retry = _fetch_provider(p, key[0] * CELL_DEG, key[1] * CELL_DEG)
+        ent = CELLS.setdefault(key, {'snaps': {}, 'last_poll': 0.0})
+        prev = ent['snaps'].get(p['name'])
+        if snap is not None and not snap['ac'] and prev and len(prev['ac']) >= 5:
+            snap = None   # vacío sospechoso tras un snapshot poblado: trátalo como fallo
+        if snap is not None:
+            p['fails'] = 0
+            ent['snaps'][p['name']] = snap
+            ent['last_poll'] = time.time()
+        else:
+            p['fails'] += 1
+            cool = retry if retry > 0 else min(60.0, 5.0 * 2 ** (p['fails'] - 1))
+            p['next_ok'] = time.time() + max(cool, MIN_PROVIDER_GAP_S)
+        return snap
 
-def _ensure_refresher():
-    global _refresher_started
-    if _refresher_started:
+def _poller_loop():
+    while True:
+        t0 = time.time()
+        try:
+            for k, seen in list(LAST_REQ.items()):
+                if t0 - seen > 120.0:
+                    LAST_REQ.pop(k, None)
+                    CELLS.pop(k, None)
+            active = [(k, CELLS.get(k, {}).get('last_poll', 0.0)) for k, seen in list(LAST_REQ.items()) if t0 - seen <= ACTIVE_WINDOW_S]
+            if active:
+                _poll_cell(min(active, key=lambda x: x[1])[0])
+        except Exception:
+            pass
+        time.sleep(max(0.05, POLL_GAP_S - (time.time() - t0)))
+
+def _ensure_poller():
+    global _poller_started
+    if _poller_started:
         return
     with _STATE_LOCK:
-        if not _refresher_started:
-            threading.Thread(target=_refresher_loop, daemon=True, name='adsb-refresh').start()
-            _refresher_started = True
+        if not _poller_started:
+            threading.Thread(target=_poller_loop, daemon=True, name='adsb-poller').start()
+            _poller_started = True
+
+def _merge(ent, now):
+    """Une los snapshots vigentes de todos los proveedores: por ICAO hex gana el fix más reciente."""
+    best, newest = {}, None
+    for s in ent['snaps'].values():
+        if now - s['fetched'] > MAX_STALE_S:
+            continue
+        if newest is None or s['fetched'] > newest['fetched']:
+            newest = s
+        for a in s['ac']:
+            h = a.get('hex') or id(a)
+            cur = best.get(h)
+            if cur is None or a['_pos_t'] > cur['_pos_t']:
+                best[h] = a
+    return list(best.values()), newest
 
 def get_live_aircraft(cur_lat, cur_lon):
-    _ensure_refresher()
+    _ensure_poller()
     key = _cell_key(cur_lat, cur_lon)
     LAST_REQ[key] = time.time()
-    snap = CACHE.get(key)
-    if not snap or time.time() - snap['fetched'] >= FRESH_TTL_S:
-        snap = _refresh_cell(key, block=(snap is None))
-    if not snap:
+    ent = CELLS.get(key)
+    if not ent or not ent['snaps']:                  # arranque en frío: único caso en que se espera al upstream
+        for _ in range(4):
+            if _poll_cell(key):
+                break
+            time.sleep(0.5)
+        ent = CELLS.get(key)
+    if not ent:
         return [], 'offline', 0.0
-    age = max(0.0, time.time() - snap['fetched'])
-    if age > MAX_STALE_S:
-        return [], snap['source'], age
-    return snap['ac'], snap['source'], age
+    now = time.time()
+    ac, newest = _merge(ent, now)
+    if not newest:
+        return [], 'offline', MAX_STALE_S
+    return ac, newest['source'], max(0.0, now - newest['fetched'])
 
 # =========================================================================
 # 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
@@ -238,7 +270,7 @@ def get_data():
         lon = float(request.args.get('lon', 2.2876))
         alt = float(request.args.get('alt', 145.0))
         user_lead_sec = max(0.0, min(15.0, float(request.args.get('lead', 6.0))))
-        raw_ac, source_feed, _ = get_live_aircraft(lat, lon)
+        raw_ac, source_feed, feed_age = get_live_aircraft(lat, lon)
         now_epoch = time.time()  # instante único de referencia (aviones, astros y tca_epoch)
         t_now = ts.from_datetime(datetime.fromtimestamp(now_epoch, timezone.utc))
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
@@ -295,6 +327,17 @@ def get_data():
             except Exception:
                 pass
             return ("SET" if is_vis else "RISE"), "--:--", 0
+
+        _raw_event = get_next_event
+        def get_next_event(body_obj, is_vis):
+            ck = (body_obj is moon, is_vis, round(lat, 3), round(lon, 3), round(alt))
+            c = _EVENT_CACHE.get(ck)
+            if c and c[2] > now_epoch + 1.0 and now_epoch - c[3] < 120.0:
+                return c[0], c[1], max(0, int(c[2] - now_epoch))
+            r = _raw_event(body_obj, is_vis)
+            if r[1] != '--:--':
+                _EVENT_CACHE[ck] = (r[0], r[1], now_epoch + r[2], now_epoch)
+            return r
 
         moon_ev_type, moon_ev_str, moon_ev_sec = get_next_event(moon, moon_is_visible)
         sun_ev_type, sun_ev_str, sun_ev_sec = get_next_event(sun, sun_is_visible)
@@ -548,6 +591,7 @@ def get_data():
 
         return jsonify({
             'source_feed': source_feed,
+            'feed_age_s': round(feed_age, 2),
             'server_time': now_epoch,
             'lead_used_sec': round(user_lead_sec, 1),
             'observer_altitude_used_m': alt,
@@ -723,6 +767,7 @@ HTML_TEMPLATE = r"""
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
 
         /* ===== TEMA PROFESIONAL v27 ===== */
+        @keyframes rotor{to{transform:rotate(360deg)}}
         :root{--bg:#070b12;--s1:#0c121d;--s2:#111a29;--line:rgba(148,163,184,.14);--line2:rgba(148,163,184,.28);--tx:#e6edf7;--mut:#8696ae;--moon:#7dd3fc;--sun:#fbbf24;--bad:#f87171;--ok:#34d399;--acc:#38bdf8}
         html,body{background:var(--bg)}
         body{color:var(--tx);font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
@@ -959,11 +1004,11 @@ HTML_TEMPLATE = r"""
         L.control.zoom({ position: 'bottomright' }).addTo(map);
 
         const cartoDarkLayer = L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png?key=${CARTO_KEY}`, {
-            subdomains: 'abcd', maxZoom: 20, attribution: '&copy; CARTO &bull; DE421'
+            subdomains: 'abcd', maxZoom: 20, attribution: '&copy; CARTO &bull; ADS-B: airplanes.live, adsb.lol, <a href="https://adsb.fi" target="_blank" rel="noopener">adsb.fi</a>'
         });
 
         const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            maxZoom: 18, attribution: 'Esri Satellite'
+            maxZoom: 18, attribution: 'Esri &bull; ADS-B: airplanes.live, adsb.lol, <a href="https://adsb.fi" target="_blank" rel="noopener">adsb.fi</a>'
         });
 
         currentBaseTileLayer = cartoDarkLayer;
@@ -1341,13 +1386,70 @@ HTML_TEMPLATE = r"""
                     lon + (d * Math.sin(trackRad)) / (111139.0 * Math.cos(lat * Math.PI / 180.0))];
         }
 
+        // ---------- Siluetas por familia de aeronave (vista cenital, norte arriba) ----------
+        const AC_RULES = [
+            ['heli', /^(H\d\d|H500|EC\d\d|AS\d\d|R22|R44|R66|B06|B07|B40\d|B41\d|B42\d|S76|S92|S61|AW\d\d|A109|A119|A139|A169|A189|MD\d\d$|BK17|EN28|NH90|UH\d|CH\d|MI\d|KA\d)/],
+            ['quad', /^(A388|B744|B748|B74S|B74R|A342|A343|A345|A346|IL96|C17|A124|B52|K35R|E3TF|E3CF)$/],
+            ['tp4', /^(A400|C130|C30J|C160|AN12|P3)$/],
+            ['wide', /^(A306|A30B|A310|A332|A333|A338|A339|A359|A35K|B762|B763|B764|B772|B773|B77L|B77W|B778|B779|B788|B789|B78X|MD11|DC10|IL86|A3ST)$/],
+            ['tp', /^(AT\d\d|ATP|DH8[A-D]|DHC\d|SF34|JS\d\d|SW\d|B190|E120|F50|F27|PC12|C208|C212|CN35|AN2\d?|BE9\w|BE20|BE30|TBM\d|P180|PAY\d)/],
+            ['rear', /^(CRJ\d|CRJX|E13\d|E14\d|E45X|F28|F70|F100|B72\d|B712|MD8\d|MD9\d|DC9\w?|BAE\d|RJ\d\d|J328|T154|T134|B46\d|SU95)/],
+            ['biz', /^(C25\w|C5\d\w|C6\d\w|C68\w|C700|C750|LJ\d\d|GL\d\w|GLF\d|GLEX|G\d{3}$|FA\d\w|F2TH|F900|E50P|E55P|H25\w|CL\d\d|PRM1|SF50|BE40|HDJT|EA50|LEG\d|PC24|ASTR|WW24|E545|E550)/],
+            ['light', /^(C1\d\d|C2\d\d$|C[0-9]{2}[A-Z]$|PA\d\d|P28\w|P32\w|SR2\d|DA\d\d|DV20|BE3\d|BE5\d|BE6\d|M20\w|TB\d\d|AA5|RV\d|G115|ROBN|PIVI|S22T|COZY|DR40|AC\d\w|MO\d)/],
+        ];
+        const AC_PROFILE = {
+            narrow: { len: 56, fw: 3.8, span: 15,   wy: 23, sw: 8,   root: 8,   tip: 2.6, eng: [5.8],       tail: 6.5, tOff: 12, size: 30 },
+            wide:   { len: 60, fw: 4.8, span: 19.5, wy: 21, sw: 11,  root: 10.5, tip: 3,  eng: [7.4],       tail: 7.5, tOff: 12, size: 36 },
+            quad:   { len: 62, fw: 5,   span: 20.5, wy: 21, sw: 12,  root: 11,  tip: 3,   eng: [6.4, 11.6], tail: 8,   tOff: 12, size: 40 },
+            rear:   { len: 50, fw: 3.3, span: 12.5, wy: 25, sw: 6,   root: 7,   tip: 2.4, rear: 1.9,        tail: 5.5, tOff: 8,  size: 27 },
+            biz:    { len: 40, fw: 2.8, span: 10.5, wy: 24, sw: 6,   root: 6,   tip: 2,   rear: 1.7,        tail: 4.5, tOff: 7,  size: 23 },
+            tp:     { len: 46, fw: 3.6, span: 17,   wy: 22, sw: 0.8, root: 5.5, tip: 4,   eng: [6.5],       tail: 6.5, tOff: 9,  size: 28, prop: 1 },
+            tp4:    { len: 50, fw: 4.4, span: 22,   wy: 22, sw: 1,   root: 7,   tip: 5,   eng: [6.5, 12],  tail: 8,   tOff: 9,  size: 38, prop: 1 },
+            light:  { len: 32, fw: 2.4, span: 14,   wy: 25, sw: 0,   root: 6,   tip: 5,   nose: 1,         tail: 5,   tOff: 6,  size: 21, prop: 1 }
+        };
+        function acKind(model) {
+            const m = (model || '').toUpperCase();
+            for (const [k, re] of AC_RULES) if (re.test(m)) return k;
+            return 'narrow';
+        }
+        function aircraftSvg(kind, fill) {
+            const ST = 'stroke="#04080f" stroke-width="1" stroke-linejoin="round"';
+            if (kind === 'heli') {
+                return `<svg viewBox="0 0 64 64" width="30" height="30" style="overflow:visible">
+                    <rect x="31" y="44" width="2" height="16" fill="${fill}" ${ST}/><rect x="28.5" y="58" width="7" height="2" fill="${fill}" ${ST}/>
+                    <ellipse cx="32" cy="36" rx="5" ry="10" fill="${fill}" ${ST}/>
+                    <circle cx="32" cy="36" r="23" fill="${fill}" opacity=".08"/>
+                    <g style="transform-origin:32px 36px;animation:rotor .45s linear infinite">
+                    <line x1="9" y1="36" x2="55" y2="36" stroke="${fill}" stroke-width="1.6" opacity=".85"/><line x1="32" y1="13" x2="32" y2="59" stroke="${fill}" stroke-width="1.6" opacity=".85"/></g></svg>`;
+            }
+            const P = AC_PROFILE[kind] || AC_PROFILE.narrow, c = 32, f = P.fw / 2;
+            const y0 = 32 - P.len / 2, y1 = 32 + P.len / 2, ty = y1 - P.tOff;
+            const fus = `M${c} ${y0} C${c+f} ${y0} ${c+f} ${y0+5} ${c+f} ${y0+10} L${c+f} ${y1-9} L${c+f*.3} ${y1} L${c-f*.3} ${y1} L${c-f} ${y1-9} L${c-f} ${y0+10} C${c-f} ${y0+5} ${c-f} ${y0} ${c} ${y0}Z`;
+            const wing = s => `M${c+s*f} ${P.wy} L${c+s*P.span} ${P.wy+P.sw} L${c+s*P.span} ${P.wy+P.sw+P.tip} L${c+s*f} ${P.wy+P.root}Z`;
+            const tail = s => `M${c+s*f} ${ty} L${c+s*P.tail} ${ty+2.2} L${c+s*P.tail} ${ty+4} L${c+s*f} ${ty+5.2}Z`;
+            let eng = '';
+            (P.eng || []).forEach(x => [-1, 1].forEach(s => {
+                const cy = P.wy + P.sw * (x - f) / (P.span - f) - 0.5, cx = c + s * x;
+                eng += `<ellipse cx="${cx}" cy="${cy}" rx="${P.prop ? 1.5 : 1.7}" ry="${P.prop ? 5 : 4.2}" fill="${fill}" ${ST}/>`;
+                if (P.prop) eng += `<ellipse cx="${cx}" cy="${cy - 5.4}" rx="3.6" ry=".7" fill="${fill}" opacity=".55"/>`;
+            }));
+            if (P.rear) [-1, 1].forEach(s => { eng += `<ellipse cx="${c + s * (f + P.rear)}" cy="${y1 - 14}" rx="1.5" ry="4" fill="${fill}" ${ST}/>`; });
+            if (P.nose) eng += `<ellipse cx="${c}" cy="${y0 - 0.5}" rx="5" ry=".8" fill="${fill}" opacity=".55"/>`;
+            return `<svg viewBox="0 0 64 64" width="${P.size}" height="${P.size}" style="overflow:visible">
+                <path d="${wing(-1)}" fill="${fill}" ${ST}/><path d="${wing(1)}" fill="${fill}" ${ST}/>
+                <path d="${tail(-1)}" fill="${fill}" ${ST}/><path d="${tail(1)}" fill="${fill}" ${ST}/>
+                ${eng}<path d="${fus}" fill="${fill}" ${ST}/>
+                <path d="M${c-f*.55} ${y0+4.5} Q${c} ${y0+2.6} ${c+f*.55} ${y0+4.5} L${c+f*.4} ${y0+6.2} L${c-f*.4} ${y0+6.2}Z" fill="#04080f" opacity=".55"/></svg>`;
+        }
+
         function planeIconHtml(plane) {
             const color = getAltitudeColor(plane.alt_ft);
             const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
             const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
-            const glow = anyT ? 'filter: drop-shadow(0 0 10px #ef4444);' : (anyC ? 'filter: drop-shadow(0 0 6px #f59e0b);' : '');
-            return `<div style="transform: rotate(${plane.track}deg); width: 24px; height: 24px; display:flex; align-items:center; justify-content:center; ${glow}">
-                <svg viewBox="0 0 24 24" width="22" height="22" fill="${color}"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg></div>`;
+            const glow = anyT ? 'filter: drop-shadow(0 0 8px #ef4444);' : (anyC ? 'filter: drop-shadow(0 0 6px #f59e0b);' : 'filter: drop-shadow(0 1px 2px rgba(0,0,0,.7));');
+            const lbl = (anyT || anyC) ? `<div style="position:absolute;left:36px;top:15px;white-space:nowrap;pointer-events:none;font:600 10px 'JetBrains Mono',monospace;padding:1px 5px;border-radius:4px;background:rgba(7,11,18,.88);border:1px solid ${anyT ? '#ef4444' : '#f59e0b'};color:${anyT ? '#fca5a5' : '#fcd34d'}">${plane.callsign}</div>` : '';
+            return `<div style="position:relative;width:44px;height:44px">
+                <div style="transform: rotate(${plane.track}deg); width:44px; height:44px; display:flex; align-items:center; justify-content:center; ${glow}">${aircraftSvg(acKind(plane.model), color)}</div>${lbl}</div>`;
         }
 
         function popupHtml(p) {
@@ -1364,7 +1466,7 @@ HTML_TEMPLATE = r"""
             fetchBusy = true;
             const seq = ++fetchSeq;
             const ctl = new AbortController();
-            const to = setTimeout(() => ctl.abort(), 6000);
+            const to = setTimeout(() => ctl.abort(), 10000);
             const feed = document.getElementById('feed-badge');
             try {
                 const totalObserverAlt = Math.round(terrainElevationM + buildingOffsetM);
@@ -1386,7 +1488,9 @@ HTML_TEMPLATE = r"""
         function applyData(data) {
             moonDataGlobal = data.moon;
             sunDataGlobal = data.sun;
-            if (data.source_feed) document.getElementById('feed-badge').innerText = data.source_feed.toUpperCase();
+            const fb = document.getElementById('feed-badge'), fa = data.feed_age_s;
+            fb.innerText = (data.source_feed || 'FEED').toUpperCase() + (fa !== undefined ? ` · ${fa.toFixed(1)}s` : '');
+            fb.dataset.state = (fa !== undefined && fa > 8) ? 'bad' : 'ok';
 
             const mCoords = document.getElementById('moon-coords');
             const mBadge = document.getElementById('moon-badge');
@@ -1419,7 +1523,7 @@ HTML_TEMPLATE = r"""
                 let st = planesState[k];
 
                 if (!st) {
-                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [24, 24], iconAnchor: [12, 12] }) }).addTo(map);
+                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [44, 44], iconAnchor: [22, 22] }) }).addTo(map);
                     marker.bindPopup(popupHtml(plane));
                     st = planesState[k] = { marker, curLat: pl, curLon: po, errN: 0, errE: 0, iconSig: sig };
                 } else {
@@ -1428,7 +1532,7 @@ HTML_TEMPLATE = r"""
                     const eE = (st.curLon - po) * 111139.0 * Math.cos(pl * Math.PI / 180.0);
                     if (Math.hypot(eN, eE) < 1500) { st.errN = eN; st.errE = eE; } else { st.errN = 0; st.errE = 0; }
                     if (st.iconSig !== sig) {
-                        st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [24, 24], iconAnchor: [12, 12] }));
+                        st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [44, 44], iconAnchor: [22, 22] }));
                         st.iconSig = sig;
                     }
                     st.marker.setPopupContent(popupHtml(plane));
@@ -1439,7 +1543,7 @@ HTML_TEMPLATE = r"""
             });
 
             for (const k in planesState) {
-                if (!seenKeys.has(k) && nowSec - planesState[k].lastSeen > 6.0) {
+                if (!seenKeys.has(k) && nowSec - planesState[k].lastSeen > 12.0) {
                     map.removeLayer(planesState[k].marker);
                     delete planesState[k];
                     delete tcaSmoothedEpochs[k];
