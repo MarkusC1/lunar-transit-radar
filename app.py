@@ -232,15 +232,14 @@ def get_live_aircraft(cur_lat, cur_lon):
                 if h:
                     TRACK_MEMORY[h] = ac
 
-        # Purgado de aeronaves únicamente si no se reciben datos tras 60 segundos
+        # Retención cinemática hasta 60s para evitar desapariciones
         purged = {}
         for h, ac in TRACK_MEMORY.items():
             if (now - ac.get('_pos_t', now)) < 60.0:
                 purged[h] = ac
         TRACK_MEMORY = purged
 
-        active_list = list(TRACK_MEMORY.values())
-        return active_list, LAST_PROVIDER_USED, 0.0
+        return list(TRACK_MEMORY.values()), LAST_PROVIDER_USED, 0.0
 
 # =========================================================================
 # 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
@@ -260,7 +259,7 @@ def get_data():
         obs_loc = earth + topos_loc
         p_mbar, t_c = calculate_atmosphere(alt)
 
-        # 1. Astrometría Lunar
+        # Astrometría Lunar
         app_moon = obs_loc.at(t_now).observe(moon).apparent()
         m_alt, m_az, m_dist = app_moon.altaz(pressure_mbar=p_mbar, temperature_C=t_c)
         moon_az0 = float(m_az.degrees)
@@ -269,7 +268,7 @@ def get_data():
         moon_radius_deg = float(math.degrees(math.asin(min(1.0, MOON_RADIUS_KM / moon_dist_km))))
         moon_is_visible = bool(moon_alt0 > -0.5)
 
-        # 2. Astrometría Solar
+        # Astrometría Solar
         app_sun = obs_loc.at(t_now).observe(sun).apparent()
         s_alt, s_az, s_dist = app_sun.altaz(pressure_mbar=p_mbar, temperature_C=t_c)
         sun_az0 = float(s_az.degrees)
@@ -611,7 +610,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND TÁCTICO CON SILUETAS FR24 Y DIAGRAMAS COMPLETOS
+# 5. FRONTEND: CABINA TÁCTICA CON SILUETA Y PASTILLA CALLSIGN FR24
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -1062,60 +1061,67 @@ HTML_TEMPLATE = r"""
         function getAltitudeColor(altFt) {
             if (altFt < 3000) return '#ef4444';
             if (altFt < 10000) return '#f97316';
-            if (altFt < 18000) return '#eab308';
+            if (altFt < 18000) return '#ffd000';  // Amarillo clásico FR24
             if (altFt < 28000) return '#22c55e';
             if (altFt < 36000) return '#06b6d4';
             return '#a855f7';
         }
 
         // =====================================================================
-        // SILUETAS AERONÁUTICAS PROFESIONALES ESTILO FLIGHTRADAR24 (FR24)
+        // SILUETA FR24 EXACTA + PASTILLA CALLSIGN HORIZONTAL
         // =====================================================================
         function planeIconHtml(plane) {
             const color = getAltitudeColor(plane.alt_ft);
             const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
             const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
             
-            let filterStyle = 'filter: drop-shadow(0 2px 4px rgba(0,0,0,0.85));';
-            let alertRing = '';
-            let labelBadge = '';
+            let filterStyle = 'filter: drop-shadow(0 1.5px 3px rgba(0,0,0,0.8));';
+            let labelBorder = 'border-slate-700/60';
+            let labelText = 'text-slate-100';
+            let labelBg = 'bg-[#0b1325]/90';
 
             if (anyT) {
-                filterStyle = 'filter: drop-shadow(0 0 8px #ef4444) drop-shadow(0 2px 4px rgba(0,0,0,0.9));';
-                alertRing = '<div class="absolute inset-0 rounded-full border-2 border-red-500 animate-ping opacity-75 pointer-events-none"></div>';
-                labelBadge = `<div style="position:absolute;left:34px;top:8px;white-space:nowrap;pointer-events:none;font:700 10px 'JetBrains Mono',monospace;padding:1px 6px;border-radius:4px;background:rgba(15,23,42,0.95);border:1px solid #ef4444;color:#fca5a5;box-shadow:0 0 10px rgba(239,68,68,0.5)">${plane.callsign}</div>`;
+                filterStyle = 'filter: drop-shadow(0 0 7px #ef4444) drop-shadow(0 2px 4px rgba(0,0,0,0.9));';
+                labelBorder = 'border-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]';
+                labelText = 'text-red-300';
+                labelBg = 'bg-red-950/90';
             } else if (anyC) {
-                filterStyle = 'filter: drop-shadow(0 0 6px #f59e0b) drop-shadow(0 2px 4px rgba(0,0,0,0.9));';
-                labelBadge = `<div style="position:absolute;left:34px;top:8px;white-space:nowrap;pointer-events:none;font:700 10px 'JetBrains Mono',monospace;padding:1px 6px;border-radius:4px;background:rgba(15,23,42,0.95);border:1px solid #f59e0b;color:#fcd34d">${plane.callsign}</div>`;
+                filterStyle = 'filter: drop-shadow(0 0 5px #f59e0b) drop-shadow(0 2px 4px rgba(0,0,0,0.9));';
+                labelBorder = 'border-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]';
+                labelText = 'text-amber-300';
+                labelBg = 'bg-amber-950/90';
             }
 
             return `
-                <div style="position:relative;width:40px;height:40px;display:flex;align-items:center;justify-content:center;">
-                    ${alertRing}
-                    <svg viewBox="0 0 48 48" width="34" height="34" style="transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.15s linear;">
-                        <!-- Silueta exacta comercial: morro, fuselaje, motores gemelos, alas en flecha con winglets y cola -->
-                        <path fill="${color}" stroke="#030712" stroke-width="1.3" stroke-linejoin="round" d="
-                            M 24 3.5
-                            C 25.2 3.5, 26.2 5.5, 26.2 11
-                            L 26.2 15
-                            L 28.6 16.5 L 28.6 20.8 L 31.4 20.8 L 31.4 17.8
-                            L 44.5 24.2 L 45.2 22.8 L 45.8 23.4 L 44.6 26.2
-                            L 26.5 22.4
-                            L 26.2 34.5
-                            L 34.8 39.8 L 34.8 41.5 L 25.6 40.8
-                            L 24 44.5
-                            L 22.4 40.8 L 13.2 41.5 L 13.2 39.8
-                            L 21.8 34.5
-                            L 21.5 22.4
-                            L 3.4 26.2 L 2.2 23.4 L 2.8 22.8 L 3.5 24.2
-                            L 16.6 17.8 L 16.6 20.8 L 19.4 20.8 L 19.4 16.5
-                            L 21.8 15
-                            L 21.8 11
-                            C 21.8 5.5, 22.8 3.5, 24 3.5 Z
-                        "/>
-                        <path d="M 24 6 L 24 13" stroke="#030712" stroke-width="0.8" opacity="0.6"/>
-                    </svg>
-                    ${labelBadge}
+                <div style="position:relative; width:32px; height:32px; display:flex; align-items:center; justify-content:center;">
+                    <!-- Avión FR24: gira con el rumbo 'track' -->
+                    <div style="width:32px; height:32px; display:flex; align-items:center; justify-content:center; transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.2s linear;">
+                        <svg viewBox="0 0 32 32" width="26" height="26">
+                            <path fill="${color}" stroke="#070c18" stroke-width="0.75" stroke-linejoin="round" d="
+                                M16,2.5
+                                C16.6,2.5 17.2,3.3 17.2,5.5
+                                L17.2,11
+                                L19.5,12.5 L19.5,14.8 L21.2,14.8 L21.2,13.2
+                                L29.5,17.8 L29.8,19 L17.5,16.2
+                                L17.2,25.2
+                                L22.5,28.8 L22.5,30 L16.8,29.2
+                                L16,30.5
+                                L15.2,29.2 L9.5,30 L9.5,28.8
+                                L14.8,25.2
+                                L14.5,16.2
+                                L2.2,19 L2.5,17.8 L10.8,13.2
+                                L10.8,14.8 L12.5,14.8 L12.5,12.5
+                                L14.8,11
+                                L14.8,5.5
+                                C14.8,3.3 15.4,2.5 16,2.5 Z
+                            "/>
+                        </svg>
+                    </div>
+
+                    <!-- Pastilla Callsign horizontal estilo Flightradar24 -->
+                    <div class="absolute left-[30px] px-1.5 py-0.5 rounded border ${labelBorder} ${labelBg} ${labelText} text-[10px] font-bold font-mono tracking-wider pointer-events-none select-none whitespace-nowrap shadow-md backdrop-blur-sm">
+                        ${plane.callsign}
+                    </div>
                 </div>
             `;
         }
@@ -1292,11 +1298,11 @@ HTML_TEMPLATE = r"""
                 let st = planesState[k];
 
                 if (!st) {
-                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [40, 40], iconAnchor: [20, 20] }) }).addTo(map);
+                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }) }).addTo(map);
                     marker.bindPopup(popupHtml(plane));
                     st = planesState[k] = { marker, curLat: pl, curLon: po };
                 } else {
-                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [40, 40], iconAnchor: [20, 20] }));
+                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }));
                     st.marker.setPopupContent(popupHtml(plane));
                 }
                 st.baseLat = plane.lat; st.baseLon = plane.lon; st.tRef = tRef;
@@ -1483,7 +1489,7 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // BLINDADO CON FR24 ICONS")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS Y LABELS FR24")
     print(f" [OK] Buffer de Memoria (60s hold) & Fallback: ACTIVO")
     print(f" [OK] Servidor escuchando en puerto: {port}")
     print("="*60 + "\n")
