@@ -111,167 +111,156 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. INGESTA ADS-B: 3 FUENTES, RITMO EDUCADO Y TIEMPO EXACTO POR POSICIÓN
-#    Las tres APIs limitan a 1 req/s (airplanes.live, adsb.fi) o de forma dinámica
-#    (adsb.lol) y no dan SLA. Render comparte IP de centro de datos, así que se
-#    trabaja MUY por debajo del límite, con enfriamiento tras 429/403/5xx.
-#    Ninguna petición de usuario toca el upstream salvo el arranque en frío.
-#    Datos: airplanes.live · adsb.lol · adsb.fi (uso personal, no comercial).
+# 2. INGESTA MULTI-FUENTE ADS-B CON FALLBACK GARANTIZADO
 # =========================================================================
+HTTP_HEADERS = {
+    'User-Agent': 'LunarTransitRadar/3.0 (Astronomical Observation Research Engine; OpenData)',
+    'Accept': 'application/json'
+}
+
 PROVIDERS = [
-    {'name': 'airplanes.live', 'url': 'https://api.airplanes.live/v2/point/{lat:.4f}/{lon:.4f}/80'},
-    {'name': 'adsb.lol', 'url': 'https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/80'},
-    {'name': 'adsb.fi', 'url': 'https://opendata.adsb.fi/api/v2/lat/{lat:.4f}/lon/{lon:.4f}/dist/80'},
+    {'name': 'adsb.fi', 'type': 'readsb', 'url': 'https://opendata.adsb.fi/api/v2/lat/{lat:.4f}/lon/{lon:.4f}/dist/80', 'next_ok': 0.0},
+    {'name': 'adsb.lol', 'type': 'readsb', 'url': 'https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/80', 'next_ok': 0.0},
+    {'name': 'adsb.one', 'type': 'readsb', 'url': 'https://api.adsb.one/v2/point/{lat:.4f}/{lon:.4f}/80', 'next_ok': 0.0},
+    {'name': 'opensky', 'type': 'opensky', 'url': 'https://opensky-network.org/api/states/all?lamin={lamin:.4f}&lomin={lomin:.4f}&lamax={lamax:.4f}&lomax={lomax:.4f}', 'next_ok': 0.0}
 ]
-for _p in PROVIDERS:
-    _p.update({'next_ok': 0.0, 'fails': 0, 'last_used': 0.0})
-HTTP_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LunarTransitRadar/27 (personal, non-commercial)', 'Accept': 'application/json'}
-CELL_DEG = 0.1             # rejilla (~11 km); el radio de 80 nm la cubre de sobra
-POLL_GAP_S = 1.2           # una petición global cada 1.2 s, rotando de proveedor
-MIN_PROVIDER_GAP_S = 2.0   # ningún proveedor recibe más de 1 petición cada 2 s
-MAX_STALE_S = 20.0         # un snapshot más viejo no se usa
-MAX_POS_AGE_S = 20.0       # un fix más viejo se descarta (ADS-C, cobertura perdida)
-ACTIVE_WINDOW_S = 30.0
 
+AIRCRAFT_CACHE = {
+    'lat': None,
+    'lon': None,
+    'aircraft': [],
+    'source': 'offline',
+    'timestamp': 0.0,
+    'fails': 0
+}
+_CACHE_LOCK = threading.Lock()
 HTTP_SESSION = requests.Session()
-CELLS = {}
-LAST_REQ = {}
-_POLL_LOCK = threading.Lock()
-_STATE_LOCK = threading.Lock()
-_poller_started = False
 _EVENT_CACHE = {}
-COLD_TRY = {}
 
-def _cell_key(lat, lon):
-    return (round(lat / CELL_DEG), round(lon / CELL_DEG))
-
-def _fetch_provider(p, clat, clon):
-    """Devuelve (snapshot|None, retry_after_s). Cada aeronave lleva _pos_t = instante real del fix."""
-    try:
-        t0 = time.time()
-        r = HTTP_SESSION.get(p['url'].format(lat=clat, lon=clon), headers=HTTP_HEADERS, timeout=(1.5, 3.0))
-        t1 = time.time()
-        p['last'] = f'HTTP {r.status_code}'
-        if r.status_code != 200:
-            try:
-                ra = float(r.headers.get('Retry-After', 0))
-            except (TypeError, ValueError):
-                ra = 0.0
-            return None, (ra if ra > 0 else (15.0 if r.status_code == 403 else 0.0))
-        data = r.json()
-        ac = data.get('ac')
-        if not isinstance(ac, list):
-            return None, 0.0
-        try:
-            api_now = float(data.get('now'))
-            if api_now > 1e11:
-                api_now /= 1000.0
-        except (TypeError, ValueError):
-            api_now = None
-        ref = api_now if (api_now and abs(api_now - t1) < 10.0) else (t0 + t1) / 2.0
-        ac = [a for a in ac if isinstance(a, dict)]
-        for a in ac:
-            try:
-                sp = float(a.get('seen_pos', a.get('seen', 0.0)) or 0.0)
-            except (TypeError, ValueError):
-                sp = 0.0
-            a['_pos_t'] = ref - max(0.0, sp)
-        p['last'] = f'ok · {len(ac)} ac'
-        return {'ac': ac, 'source': p['name'], 'fetched': t1}, 0.0
-    except Exception as e:
-        p['last'] = type(e).__name__
-        return None, 0.0
-
-def _poll_cell(key):
-    with _POLL_LOCK:
-        now = time.time()
-        ready = [p for p in PROVIDERS if p['next_ok'] <= now]
-        if not ready:
-            return None
-        p = min(ready, key=lambda x: x['last_used'])
-        p['last_used'] = now
-        p['next_ok'] = now + MIN_PROVIDER_GAP_S
-        snap, retry = _fetch_provider(p, key[0] * CELL_DEG, key[1] * CELL_DEG)
-        ent = CELLS.setdefault(key, {'snaps': {}, 'last_poll': 0.0})
-        prev = ent['snaps'].get(p['name'])
-        if snap is not None and not snap['ac'] and prev and len(prev['ac']) >= 5:
-            snap = None   # vacío sospechoso tras un snapshot poblado: trátalo como fallo
-        if snap is not None:
-            p['fails'] = 0
-            ent['snaps'][p['name']] = snap
-            ent['last_poll'] = time.time()
-        else:
-            p['fails'] += 1
-            cool = retry if retry > 0 else min(60.0, 5.0 * 2 ** (p['fails'] - 1))
-            p['next_ok'] = time.time() + max(cool, MIN_PROVIDER_GAP_S)
-        return snap
-
-def _poller_loop():
-    while True:
-        t0 = time.time()
-        try:
-            for k, seen in list(LAST_REQ.items()):
-                if t0 - seen > 120.0:
-                    LAST_REQ.pop(k, None)
-                    CELLS.pop(k, None)
-            active = [(k, CELLS.get(k, {}).get('last_poll', 0.0)) for k, seen in list(LAST_REQ.items()) if t0 - seen <= ACTIVE_WINDOW_S]
-            if active:
-                _poll_cell(min(active, key=lambda x: x[1])[0])
-        except Exception:
-            pass
-        time.sleep(max(0.05, POLL_GAP_S - (time.time() - t0)))
-
-def _ensure_poller():
-    global _poller_started
-    if _poller_started:
-        return
-    with _STATE_LOCK:
-        if not _poller_started:
-            threading.Thread(target=_poller_loop, daemon=True, name='adsb-poller').start()
-            _poller_started = True
-
-def _merge(ent, now):
-    """Une los snapshots vigentes de todos los proveedores: por ICAO hex gana el fix más reciente."""
-    best, newest = {}, None
-    for s in ent['snaps'].values():
-        if now - s['fetched'] > MAX_STALE_S:
+def parse_opensky_response(data, ref_time):
+    states = data.get('states') or []
+    normalized = []
+    for s in states:
+        if not isinstance(s, list) or len(s) < 11:
             continue
-        if newest is None or s['fetched'] > newest['fetched']:
-            newest = s
-        for a in s['ac']:
-            h = a.get('hex') or id(a)
-            cur = best.get(h)
-            if cur is None or a['_pos_t'] > cur['_pos_t']:
-                best[h] = a
-    return list(best.values()), newest
+        if s[8]:  # on_ground == True
+            continue
+        lon_val, lat_val = s[5], s[6]
+        if lat_val is None or lon_val is None:
+            continue
+        
+        baro_alt_m = s[7]
+        geom_alt_m = s[13] if len(s) > 13 else None
+        alt_baro = round(baro_alt_m * 3.28084) if baro_alt_m is not None else None
+        alt_geom = round(geom_alt_m * 3.28084) if geom_alt_m is not None else None
+        if alt_baro is None and alt_geom is None:
+            continue
+            
+        vel_ms = s[9] or 0.0
+        gs_kt = round(vel_ms * 1.94384, 1)
+        track_deg = float(s[10]) if s[10] is not None else 0.0
+        vr_ms = s[11] if s[11] is not None else 0.0
+        vr_fpm = round(vr_ms * 196.85)
 
-def feed_status():
+        hex_code = str(s[0]).lower().strip()
+        callsign = str(s[1]).strip() if s[1] else hex_code.upper()
+        pos_t = float(s[3] or s[4] or ref_time)
+
+        normalized.append({
+            'hex': hex_code,
+            'flight': callsign,
+            'lat': float(lat_val),
+            'lon': float(lon_val),
+            'alt_baro': alt_baro,
+            'alt_geom': alt_geom,
+            'track': track_deg,
+            'gs': gs_kt,
+            'baro_rate': vr_fpm,
+            'geom_rate': vr_fpm,
+            't': 'A320',
+            '_pos_t': pos_t
+        })
+    return normalized
+
+def _query_provider(provider, lat, lon):
     now = time.time()
-    return [{'name': p['name'], 'last': p.get('last', 'sin intentos'), 'fails': p['fails'],
-             'cooldown_s': round(max(0.0, p['next_ok'] - now), 1)} for p in PROVIDERS]
+    try:
+        if provider['type'] == 'readsb':
+            req_url = provider['url'].format(lat=lat, lon=lon)
+        else:
+            d_lat = 1.35
+            d_lon = 1.35 / max(0.2, math.cos(math.radians(lat)))
+            req_url = provider['url'].format(
+                lamin=lat - d_lat, lamax=lat + d_lat,
+                lomin=lon - d_lon, lomax=lon + d_lon
+            )
 
-def _feed_note():
-    return '; '.join(f"{p['name']}: {p.get('last', '?')}" for p in PROVIDERS if p['fails'])
+        resp = HTTP_SESSION.get(req_url, headers=HTTP_HEADERS, timeout=(2.0, 4.0))
+        if resp.status_code != 200:
+            provider['next_ok'] = now + (30.0 if resp.status_code in (403, 429) else 10.0)
+            return None
+
+        json_data = resp.json()
+        if provider['type'] == 'readsb':
+            ac_list = json_data.get('ac') or json_data.get('aircraft') or []
+            if not isinstance(ac_list, list):
+                return None
+            ref_now = now
+            for ac in ac_list:
+                sp = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
+                ac['_pos_t'] = ref_now - max(0.0, sp)
+            return ac_list
+        else:
+            return parse_opensky_response(json_data, now)
+
+    except Exception:
+        provider['next_ok'] = now + 12.0
+        return None
 
 def get_live_aircraft(cur_lat, cur_lon):
-    _ensure_poller()
-    key = _cell_key(cur_lat, cur_lon)
-    LAST_REQ[key] = time.time()
-    ent = CELLS.get(key)
-    if (not ent or not ent['snaps']) and time.time() - COLD_TRY.get(key, 0.0) > 4.0:
-        COLD_TRY[key] = time.time()                  # arranque en frío: único caso en que se espera al upstream
-        for _ in range(3):
-            if _poll_cell(key):
-                break
-            time.sleep(0.4)
-        ent = CELLS.get(key)
-    if not ent:
-        return [], 'offline', 0.0
+    global AIRCRAFT_CACHE
     now = time.time()
-    ac, newest = _merge(ent, now)
-    if not newest:
-        return [], 'offline', MAX_STALE_S
-    return ac, newest['source'], max(0.0, now - newest['fetched'])
+
+    with _CACHE_LOCK:
+        # Reutilizar caché en memoria si tiene menos de 2.5 segundos
+        if (AIRCRAFT_CACHE['timestamp'] > 0 and 
+            (now - AIRCRAFT_CACHE['timestamp']) < 2.5 and 
+            AIRCRAFT_CACHE['lat'] is not None and
+            math.hypot(cur_lat - AIRCRAFT_CACHE['lat'], cur_lon - AIRCRAFT_CACHE['lon']) < 0.15):
+            return AIRCRAFT_CACHE['aircraft'], AIRCRAFT_CACHE['source'], max(0.0, now - AIRCRAFT_CACHE['timestamp'])
+
+    # Intentar obtener datos frescos rotando proveedores disponibles
+    sorted_providers = sorted(PROVIDERS, key=lambda p: p['next_ok'])
+    fresh_aircraft = None
+    winning_source = 'offline'
+
+    for p in sorted_providers:
+        if p['next_ok'] > now:
+            continue
+        res = _query_provider(p, cur_lat, cur_lon)
+        if res is not None and len(res) > 0:
+            fresh_aircraft = res
+            winning_source = p['name']
+            p['next_ok'] = now + 1.5  # Pausa educada
+            print(f"[ADS-B] {len(res)} aeronaves cargadas desde {winning_source}")
+            break
+
+    with _CACHE_LOCK:
+        if fresh_aircraft is not None:
+            AIRCRAFT_CACHE = {
+                'lat': cur_lat,
+                'lon': cur_lon,
+                'aircraft': fresh_aircraft,
+                'source': winning_source,
+                'timestamp': now,
+                'fails': 0
+            }
+            return fresh_aircraft, winning_source, 0.0
+        else:
+            # Fallback por Dead Reckoning: si falla la red, no borrar la pantalla
+            AIRCRAFT_CACHE['fails'] += 1
+            age = max(0.0, now - AIRCRAFT_CACHE['timestamp'])
+            return AIRCRAFT_CACHE['aircraft'], f"{AIRCRAFT_CACHE['source']} (fallback)", age
 
 # =========================================================================
 # 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
@@ -283,8 +272,9 @@ def get_data():
         lon = float(request.args.get('lon', 2.2876))
         alt = float(request.args.get('alt', 145.0))
         user_lead_sec = max(0.0, min(15.0, float(request.args.get('lead', 6.0))))
+        
         raw_ac, source_feed, feed_age = get_live_aircraft(lat, lon)
-        now_epoch = time.time()  # instante único de referencia (aviones, astros y tca_epoch)
+        now_epoch = time.time()
         t_now = ts.from_datetime(datetime.fromtimestamp(now_epoch, timezone.utc))
         topos_loc = wgs84.latlon(lat, lon, elevation_m=alt)
         obs_loc = earth + topos_loc
@@ -326,6 +316,10 @@ def get_data():
             d_alt_dt_sun = (float(sa300.degrees) - sun_alt0) / 300.0
 
         def get_next_event(body_obj, is_vis):
+            ck = (body_obj is moon, is_vis, round(lat, 2), round(lon, 2))
+            c = _EVENT_CACHE.get(ck)
+            if c and c[2] > now_epoch + 1.0 and now_epoch - c[3] < 120.0:
+                return c[0], c[1], max(0, int(c[2] - now_epoch))
             try:
                 t_end = ts.from_datetime(datetime.now(timezone.utc) + timedelta(hours=36))
                 f_rs = almanac.risings_and_settings(eph, body_obj, topos_loc)
@@ -334,23 +328,16 @@ def get_data():
                 for t_e, ev in zip(times_rs, events_rs):
                     dt_e = t_e.utc_datetime()
                     if is_vis and ev == 0:
-                        return "SET", dt_e.strftime('%H:%M UTC'), max(0, int((dt_e - now_utc).total_seconds()))
+                        res = ("SET", dt_e.strftime('%H:%M UTC'), max(0, int((dt_e - now_utc).total_seconds())))
+                        _EVENT_CACHE[ck] = (res[0], res[1], now_epoch + res[2], now_epoch)
+                        return res
                     elif not is_vis and ev == 1:
-                        return "RISE", dt_e.strftime('%H:%M UTC'), max(0, int((dt_e - now_utc).total_seconds()))
+                        res = ("RISE", dt_e.strftime('%H:%M UTC'), max(0, int((dt_e - now_utc).total_seconds())))
+                        _EVENT_CACHE[ck] = (res[0], res[1], now_epoch + res[2], now_epoch)
+                        return res
             except Exception:
                 pass
             return ("SET" if is_vis else "RISE"), "--:--", 0
-
-        _raw_event = get_next_event
-        def get_next_event(body_obj, is_vis):
-            ck = (body_obj is moon, is_vis, round(lat, 3), round(lon, 3), round(alt))
-            c = _EVENT_CACHE.get(ck)
-            if c and c[2] > now_epoch + 1.0 and now_epoch - c[3] < 120.0:
-                return c[0], c[1], max(0, int(c[2] - now_epoch))
-            r = _raw_event(body_obj, is_vis)
-            if r[1] != '--:--':
-                _EVENT_CACHE[ck] = (r[0], r[1], now_epoch + r[2], now_epoch)
-            return r
 
         moon_ev_type, moon_ev_str, moon_ev_sec = get_next_event(moon, moon_is_visible)
         sun_ev_type, sun_ev_str, sun_ev_sec = get_next_event(sun, sun_is_visible)
@@ -391,9 +378,8 @@ def get_data():
             except (ValueError, TypeError):
                 continue
 
-            # Extrapolación de latencia calibrable
             pos_age = max(0.0, now_epoch - ac.get('_pos_t', now_epoch))
-            if pos_age > MAX_POS_AGE_S:
+            if pos_age > 75.0:
                 continue
             total_lead = pos_age + user_lead_sec
 
@@ -554,8 +540,6 @@ def get_data():
                     dir_txt = "Above" if vert_offset_deg > 0 else "Below"
                     pos_desc = f"{abs(vert_offset_deg):.2f}° {dir_txt} ({vert_body_diams} {symbol})"
 
-                dir_clean = "Above" if vert_offset_deg > 0 else "Below"
-
                 return {
                     'target': body_type,
                     'is_transit': is_transit,
@@ -567,7 +551,7 @@ def get_data():
                     'vertical_offset_deg': vert_offset_deg,
                     'vertical_offset_m': vert_offset_m,
                     'vertical_body_diams': vert_body_diams,
-                    'vertical_dir_text': dir_clean,
+                    'vertical_dir_text': "Above" if vert_offset_deg > 0 else "Below",
                     'transit_duration_s': transit_dur,
                     'angular_size_arcsec': ang_size_arcsec,
                     'disk_coverage_pct': disk_coverage_pct,
@@ -578,7 +562,6 @@ def get_data():
 
             moon_data = compute_body_intercept('moon', moon_az0, moon_alt0, moon_radius_deg, d_az_dt_moon, d_alt_dt_moon, moon_is_visible)
             sun_data = compute_body_intercept('sun', sun_az0, sun_alt0, sun_radius_deg, d_az_dt_sun, d_alt_dt_sun, sun_is_visible)
-
             primary = moon_data if moon_is_visible else (sun_data if sun_is_visible else moon_data)
 
             aircraft_results.append({
@@ -605,7 +588,6 @@ def get_data():
         return jsonify({
             'source_feed': source_feed,
             'feed_age_s': round(feed_age, 2),
-            'feed_note': _feed_note(),
             'server_time': now_epoch,
             'lead_used_sec': round(user_lead_sec, 1),
             'observer_altitude_used_m': alt,
@@ -628,14 +610,8 @@ def get_data():
         return jsonify({'error': str(e), 'aircraft': []})
 
 # =========================================================================
-# 4. RUTAS DE INDEXACIÓN Y PLANTILLA HTML
+# 4. RUTAS ESTÁTICAS Y CONTROL DE CABECERAS
 # =========================================================================
-@app.route('/api/status')
-def api_status():
-    now = time.time()
-    cells = {f'{k[0]*CELL_DEG:.1f},{k[1]*CELL_DEG:.1f}': {n: {'aircraft': len(s['ac']), 'age_s': round(now - s['fetched'], 1)} for n, s in e['snaps'].items()} for k, e in CELLS.items()}
-    return jsonify({'providers': feed_status(), 'cells': cells})
-
 @app.route('/api/time')
 def api_time():
     return jsonify({'t': time.time()})
@@ -655,7 +631,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND: CABINA TÁCTICA, TARJETAS CELESTES Y HARVARD TERMINAL
+# 5. FRONTEND TÁCTICO CON SILUETAS AERONÁUTICAS SIMPLIFICADAS
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -672,220 +648,102 @@ HTML_TEMPLATE = r"""
     <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg: #070b12; --s1: #0c121d; --s2: #111a29;
+            --line: rgba(148,163,184,.14); --line2: rgba(148,163,184,.28);
+            --tx: #e6edf7; --mut: #8696ae; --moon: #7dd3fc; --sun: #fbbf24;
+            --bad: #f87171; --ok: #34d399; --acc: #38bdf8;
+        }
         body { 
-            background-color: #020617; 
-            color: #f8fafc; 
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-            font-feature-settings: "tnum" 1;
+            background-color: var(--bg); 
+            color: var(--tx); 
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            -webkit-font-smoothing: antialiased;
         }
-        
-        .map-container { height: calc(100dvh - 114px); width: 100%; border-radius: 12px; }
-        .leaflet-container { background: #020617 !important; }
-        
-        .leaflet-div-icon {
-            background: transparent !important;
-            border: none !important;
-        }
+        .font-mono, .tabular-nums { font-family: 'JetBrains Mono', monospace; }
+        .map-container { flex: 1 1 auto; height: calc(100dvh - 90px); width: 100%; border-radius: 12px; }
+        .leaflet-container { background: #05080e !important; }
+        .leaflet-div-icon { background: transparent !important; border: none !important; }
 
-        .obs-target { 
-            position: relative;
-            display: flex; 
-            align-items: center; 
-            justify-content: center; 
-            width: 44px; 
-            height: 44px; 
-            pointer-events: none;
-        }
-        .obs-sweep {
-            position: absolute;
-            width: 44px;
-            height: 44px;
-            border-radius: 50%;
-            background: conic-gradient(from 0deg, rgba(6, 182, 212, 0.4) 0deg, transparent 60deg, transparent 360deg);
-            animation: radar-sweep 3s linear infinite;
-            will-change: transform;
-        }
-        .obs-ring { 
-            position: absolute; 
-            width: 32px; 
-            height: 32px; 
-            border-radius: 50%; 
-            background: rgba(6, 182, 212, 0.15); 
-            border: 1.5px solid #06b6d4; 
-            animation: pulse-ring 2.2s infinite ease-out; 
-        }
-        .obs-dot { 
-            width: 8px; 
-            height: 8px; 
-            border-radius: 50%; 
-            background: #22d3ee; 
-            border: 2px solid #ffffff; 
-            box-shadow: 0 0 12px #06b6d4; 
-            z-index: 10; 
-        }
+        .obs-target { position: relative; display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; pointer-events: none; }
+        .obs-sweep { position: absolute; width: 44px; height: 44px; border-radius: 50%; background: conic-gradient(from 0deg, rgba(6, 182, 212, 0.4) 0deg, transparent 60deg, transparent 360deg); animation: radar-sweep 3s linear infinite; }
+        .obs-ring { position: absolute; width: 32px; height: 32px; border-radius: 50%; background: rgba(6, 182, 212, 0.15); border: 1.5px solid #06b6d4; animation: pulse-ring 2.2s infinite ease-out; }
+        .obs-dot { width: 8px; height: 8px; border-radius: 50%; background: #22d3ee; border: 2px solid #ffffff; box-shadow: 0 0 12px #06b6d4; z-index: 10; }
         @keyframes pulse-ring { 0% { transform: scale(0.6); opacity: 1; } 100% { transform: scale(1.6); opacity: 0; } }
         @keyframes radar-sweep { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
         .tca-target { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; }
-        .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; will-change: transform; }
+        .tca-ring { position: absolute; width: 28px; height: 28px; border-radius: 50%; border: 2px dashed #ef4444; animation: tca-spin 3s linear infinite; }
         .tca-crosshair-h { position: absolute; width: 28px; height: 1.5px; background: rgba(239, 68, 68, 0.8); }
         .tca-crosshair-v { position: absolute; width: 1.5px; height: 28px; background: rgba(239, 68, 68, 0.8); }
         .tca-core { width: 6px; height: 6px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 12px #ef4444; z-index: 10; }
-        @keyframes tca-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        @keyframes tca-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
-        .avionics-panel { 
-            background: linear-gradient(180deg, rgba(15, 23, 42, 0.95) 0%, rgba(3, 7, 18, 0.98) 100%);
-            backdrop-filter: blur(14px);
-            border: 1px solid rgba(51, 65, 85, 0.7);
-            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7);
-        }
-
-        .hud-card { 
-            position: relative;
-            background: rgba(11, 19, 38, 0.85);
-            border: 1px solid rgba(30, 41, 59, 0.9);
-            backdrop-filter: blur(8px);
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-            contain: layout style;
-        }
-        .hud-card::before {
-            content: '';
-            position: absolute;
-            top: -1px; left: -1px;
-            width: 6px; height: 6px;
-            border-top: 2px solid #06b6d4;
-            border-left: 2px solid #06b6d4;
-            pointer-events: none;
-        }
-        .hud-card::after {
-            content: '';
-            position: absolute;
-            bottom: -1px; right: -1px;
-            width: 6px; height: 6px;
-            border-bottom: 2px solid #06b6d4;
-            border-right: 2px solid #06b6d4;
-            pointer-events: none;
-        }
-        .hud-card:hover { 
-            transform: translateY(-1px); 
-            border-color: rgba(6, 182, 212, 0.75);
-            box-shadow: 0 0 20px rgba(6, 182, 212, 0.2);
-        }
-
-        .glow-cyan { box-shadow: 0 0 18px rgba(6, 182, 212, 0.4); }
-        .glow-amber { box-shadow: 0 0 18px rgba(245, 158, 11, 0.4); }
-        .glow-red { box-shadow: 0 0 24px rgba(239, 68, 68, 0.45); }
-
-        .terminal-screen {
-            background-color: #010409;
-            background-image: radial-gradient(rgba(16, 185, 129, 0.12) 1px, transparent 0);
-            background-size: 20px 20px;
-        }
-
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: #020617; }
-        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
-
-        /* ===== TEMA PROFESIONAL v27 ===== */
-        @keyframes rotor{to{transform:rotate(360deg)}}
-        :root{--bg:#070b12;--s1:#0c121d;--s2:#111a29;--line:rgba(148,163,184,.14);--line2:rgba(148,163,184,.28);--tx:#e6edf7;--mut:#8696ae;--moon:#7dd3fc;--sun:#fbbf24;--bad:#f87171;--ok:#34d399;--acc:#38bdf8}
-        html,body{background:var(--bg)}
-        body{color:var(--tx);font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
-        .font-mono,.tabular-nums{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-        [class*="text-[7.5px]"],[class*="text-[8px]"],[class*="text-[9px]"]{font-size:10px!important}
-        [class*="text-[9.5px]"],[class*="text-[10px]"]{font-size:11px!important}
-        .ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-        .topbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-bottom:6px;background:var(--s1);border:1px solid var(--line);border-radius:12px}
-        .brand{display:flex;align-items:center;gap:10px}
-        .brand .brand-mark{width:28px;height:28px;color:var(--moon);stroke-width:1.5}
-        .brand h1{font-size:13px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;line-height:1.2}
-        .chips{display:flex;gap:4px;margin-top:4px}
-        .chip{font:600 10px/1 'JetBrains Mono',monospace;padding:3px 6px;border-radius:5px;border:1px solid var(--line2);color:var(--mut);background:rgba(255,255,255,.02);letter-spacing:.04em;white-space:nowrap}
-        #feed-badge{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
-        #feed-badge[data-state="bad"]{color:var(--bad);border-color:rgba(248,113,113,.4);background:rgba(248,113,113,.08)}
-        .bodies{display:flex;gap:6px}
-        .body-card{display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:10px;border:1px solid var(--line);background:var(--s2);cursor:pointer;opacity:.55;transition:.15s}
-        .body-card:hover{opacity:1}
-        .body-card.on{opacity:1}
-        #moon-status-card.on{border-color:rgba(125,211,252,.45)}
-        #sun-status-card.on{border-color:rgba(251,191,36,.45)}
-        .body-txt{display:flex;flex-direction:column;gap:2px}
-        .body-txt span{font:600 12px/1.2 'JetBrains Mono',monospace}
-        .body-txt small{font-size:10px;color:var(--mut);letter-spacing:.08em;text-transform:uppercase}
-        #moon-coords{color:var(--moon)} #sun-coords{color:var(--sun)}
-        .controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-        .stepper,.seg{display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line);border-radius:9px;background:var(--s2)}
-        .stepper .lbl{font-size:10px;font-weight:600;color:var(--mut);letter-spacing:.1em;padding:0 6px}
-        .stepper button,.seg button{min-width:26px;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600;color:var(--mut);transition:.12s}
-        .stepper button:hover,.seg button:hover{color:var(--tx);background:rgba(255,255,255,.05)}
-        .seg button.on{color:var(--tx);background:rgba(56,189,248,.16);box-shadow:inset 0 0 0 1px rgba(56,189,248,.4)}
-        #lead-display{min-width:54px;text-align:center;font:600 12px 'JetBrains Mono',monospace;color:var(--sun)}
-        .coords{font:500 11px 'JetBrains Mono',monospace;color:var(--mut)}
-        .icon-btn{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;border:1px solid var(--line);background:var(--s2);color:var(--mut);transition:.12s}
-        .icon-btn:hover{color:var(--tx);border-color:var(--line2)}
-        .icon-btn.on{color:var(--acc);border-color:rgba(56,189,248,.45);background:rgba(56,189,248,.1)}
-        .map-container{flex:1 1 auto;min-height:0;height:auto;width:100%}
-        .leaflet-container{background:#05080e!important;font-family:inherit}
-        .leaflet-bar a{background:var(--s1)!important;color:var(--tx)!important;border-color:var(--line)!important}
-        .leaflet-popup-content-wrapper,.leaflet-popup-tip{background:var(--s1);color:var(--tx);border:1px solid var(--line2);box-shadow:0 8px 24px rgba(0,0,0,.5)}
-        .leaflet-popup-content{margin:10px 12px;font:12px/1.55 'JetBrains Mono',monospace}
-        .leaflet-control-attribution{background:rgba(7,11,18,.7)!important;color:var(--mut)!important}
-        .avionics-panel{background:var(--s1);border:1px solid var(--line);box-shadow:none;backdrop-filter:none}
-        .hud-card{background:var(--s2);border:1px solid var(--line);border-radius:10px;backdrop-filter:none;contain:layout style}
-        .hud-card::before,.hud-card::after{display:none}
-        .hud-card:hover{transform:none;box-shadow:none;border-color:var(--line2)}
-        .glow-red{box-shadow:0 0 0 1px rgba(248,113,113,.55),0 0 22px rgba(248,113,113,.18)!important}
-        .glow-amber{box-shadow:0 0 0 1px rgba(245,158,11,.5),0 0 18px rgba(245,158,11,.14)!important}
-        .glow-cyan{box-shadow:none}
-        #settings-modal>div{background:var(--s1)!important;border-color:var(--line2)!important;border-radius:14px!important}
+        .topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 12px; margin-bottom: 6px; background: var(--s1); border: 1px solid var(--line); border-radius: 12px; }
+        .chips { display: flex; gap: 4px; }
+        .chip { font: 600 10px/1 'JetBrains Mono', monospace; padding: 3px 6px; border-radius: 5px; border: 1px solid var(--line2); color: var(--mut); background: rgba(255,255,255,.02); }
+        #feed-badge { color: var(--ok); border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+        #feed-badge[data-state="bad"] { color: var(--bad); border-color: rgba(248,113,113,.4); background: rgba(248,113,113,.08); }
+        
+        .body-card { display: flex; align-items: center; gap: 8px; padding: 5px 9px; border-radius: 9px; border: 1px solid var(--line); background: var(--s2); cursor: pointer; opacity: .6; transition: .15s; }
+        .body-card.on { opacity: 1; }
+        #moon-status-card.on { border-color: rgba(125,211,252,.45); }
+        #sun-status-card.on { border-color: rgba(251,191,36,.45); }
+        
+        .stepper, .seg { display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: var(--s2); }
+        .stepper button, .seg button { padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; color: var(--mut); }
+        .seg button.on { color: var(--tx); background: rgba(56,189,248,.16); box-shadow: inset 0 0 0 1px rgba(56,189,248,.4); }
+        .icon-btn { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--line); background: var(--s2); color: var(--mut); }
+        .icon-btn.on { color: var(--acc); border-color: rgba(56,189,248,.4); }
+        .hud-card { background: var(--s2); border: 1px solid var(--line); border-radius: 10px; }
+        .glow-red { box-shadow: 0 0 0 1px rgba(248,113,113,.6), 0 0 18px rgba(248,113,113,.2) !important; }
+        .glow-amber { box-shadow: 0 0 0 1px rgba(245,158,11,.5), 0 0 14px rgba(245,158,11,.15) !important; }
     </style>
 </head>
 <body class="p-1.5 md:p-2 flex flex-col h-[100dvh] overflow-hidden select-none">
     
     <header class="topbar">
-        <div class="brand">
-            <svg class="ic brand-mark" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M2.5 15.5 21.5 8.5"/></svg>
+        <div class="flex items-center gap-2">
+            <svg class="w-6 h-6 text-cyan-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="m2 15 19-7"/></svg>
             <div>
-                <h1>Lunar Transit Radar</h1>
+                <h1 class="text-xs font-bold uppercase tracking-wider text-slate-100">Lunar Transit Radar PRO</h1>
                 <div class="chips"><span id="feed-badge" class="chip">ONLINE</span><span class="chip">DE421 JPL</span><span id="sync-badge" class="chip">SYNC …</span></div>
             </div>
         </div>
-        <div class="bodies">
+        <div class="flex items-center gap-2">
             <div id="moon-status-card" class="body-card on" onclick="setFilterMode('moon')">
                 <div id="header-moon-icon" class="w-5 h-5 flex items-center justify-center"></div>
-                <div class="body-txt"><span id="moon-coords">Moon: Az --° | Alt --°</span><small>Moon · optical vector</small></div>
+                <div class="flex flex-col text-[11px] font-mono leading-tight"><span id="moon-coords" class="text-cyan-300">Moon: Az --° | Alt --°</span><small class="text-[9px] text-slate-400">LUNAR VECTOR</small></div>
                 <span id="moon-badge" class="chip">--:--</span>
             </div>
             <div id="sun-status-card" class="body-card" onclick="setFilterMode('sun')">
                 <div id="header-sun-icon" class="w-5 h-5 flex items-center justify-center"></div>
-                <div class="body-txt"><span id="sun-coords">Sun: Az --° | Alt --°</span><small>Sun · solar sight line</small></div>
+                <div class="flex flex-col text-[11px] font-mono leading-tight"><span id="sun-coords" class="text-amber-300">Sun: Az --° | Alt --°</span><small class="text-[9px] text-slate-400">SOLAR SIGHT LINE</small></div>
                 <span id="sun-badge" class="chip">--:--</span>
             </div>
         </div>
-        <div class="controls">
-            <div class="stepper"><span class="lbl">LEAD</span><button onclick="adjustLead(-0.5)">−</button><span id="lead-display">+6.0s</span><button onclick="adjustLead(0.5)">+</button></div>
+        <div class="flex items-center gap-2">
+            <div class="stepper"><span class="text-[10px] font-mono text-slate-400 px-1 font-bold">LEAD</span><button onclick="adjustLead(-0.5)">−</button><span id="lead-display" class="font-mono text-xs text-amber-400 font-bold px-1">+6.0s</span><button onclick="adjustLead(0.5)">+</button></div>
             <div class="seg">
                 <button id="btn-flt-moon" class="on" onclick="setFilterMode('moon')">Moon</button>
                 <button id="btn-flt-sun" onclick="setFilterMode('sun')">Sun</button>
                 <button id="btn-flt-all" onclick="setFilterMode('all')">Dual</button>
             </div>
-            <div class="hidden md:flex flex-col items-end leading-tight"><span id="obs-coords" class="coords">41.6079, 2.2876</span><span id="obs-alt-badge" class="coords">145 m ASL</span></div>
-            <button id="voice-btn" class="icon-btn on" onclick="toggleVoice()" title="Voz"><svg class="ic" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
-            <button id="audio-btn" class="icon-btn on" onclick="toggleAudio()" title="Sonido"><svg class="ic" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/></svg></button>
-            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg></button>
-            <button class="icon-btn" onclick="locateUser()" title="Mi ubicación"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3"/></svg></button>
+            <div class="hidden md:flex flex-col items-end text-[11px] font-mono text-slate-400 leading-tight"><span id="obs-coords">41.6079, 2.2876</span><span id="obs-alt-badge">145 m ASL</span></div>
+            <button id="voice-btn" class="icon-btn on" onclick="toggleVoice()" title="Voz"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
+            <button id="audio-btn" class="icon-btn on" onclick="toggleAudio()" title="Sonido"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/></svg></button>
+            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+            <button class="icon-btn" onclick="locateUser()" title="Mi ubicación"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
         </div>
     </header>
 
     <!-- CUERPO PRINCIPAL -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-1.5 flex-grow overflow-hidden relative">
-        
-        <!-- VISTA 1: RADAR MAP -->
-        <div id="radar-viewport" class="lg:col-span-3 rounded-xl overflow-hidden border border-slate-800 relative shadow-2xl flex flex-col">
+        <div id="radar-viewport" class="lg:col-span-3 rounded-xl overflow-hidden border border-slate-800 relative flex flex-col">
             <div id="map" class="map-container"></div>
             
-            <div class="hidden sm:flex absolute top-2.5 right-2.5 z-[1000] bg-slate-950/90 backdrop-blur p-2 rounded-xl text-[9px] border border-slate-800/80 flex-col gap-1 shadow-2xl">
-                <span class="font-bold text-slate-400 uppercase text-[8px] mb-0.5 tracking-wider">Flight Level (FL)</span>
+            <div class="hidden sm:flex absolute top-2.5 right-2.5 z-[1000] bg-slate-950/90 backdrop-blur p-2 rounded-xl text-[10px] font-mono border border-slate-800 flex-col gap-1 shadow-2xl">
+                <span class="font-bold text-slate-400 uppercase text-[9px] mb-0.5">FLIGHT LEVEL</span>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#ef4444]"></span> &lt; 3k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#f97316]"></span> 3k - 10k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#eab308]"></span> 10k - 18k ft</div>
@@ -894,18 +752,17 @@ HTML_TEMPLATE = r"""
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#a855f7]"></span> &gt; 36k ft</div>
             </div>
 
-            <div class="absolute bottom-2.5 left-2.5 z-[1000] bg-slate-950/90 backdrop-blur px-2.5 py-1.5 rounded-lg text-[11px] border border-slate-800 text-slate-300 flex items-center gap-2">
+            <div class="absolute bottom-2.5 left-2.5 z-[1000] bg-slate-950/90 backdrop-blur px-2.5 py-1.5 rounded-lg text-[11px] font-mono border border-slate-800 text-slate-300 flex items-center gap-2">
                 <span id="footer-vector-indicator" class="font-bold text-cyan-400">━━━━</span>
                 <span id="footer-astro-info">Optical Sight Vector Active</span>
             </div>
         </div>
 
-        <!-- TELEMETRÍA LATERAL HUD (TARJETAS POD MODULARES) -->
-        <div class="avionics-panel rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 shadow-2xl max-h-[42vh] lg:max-h-full">
+        <div class="bg-slate-900/60 rounded-xl p-2.5 overflow-y-auto flex flex-col gap-2 border border-slate-800 shadow-2xl max-h-[42vh] lg:max-h-full">
             <div class="flex justify-between items-center border-b border-slate-800 pb-1.5">
                 <h2 class="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                    <span>Sector telemetry</span>
-                    <span id="plane-count" class="bg-cyan-950 text-cyan-300 px-1.5 py-0.2 rounded-full text-[9px] border border-cyan-800 font-mono tabular-nums">0</span>
+                    <span>Sector Telemetry</span>
+                    <span id="plane-count" class="bg-cyan-950 text-cyan-300 px-1.5 py-0.2 rounded-full text-[10px] border border-cyan-800 font-mono tabular-nums">0</span>
                 </h2>
                 <span id="filter-indicator" class="text-[9px] text-cyan-400 font-mono font-bold tracking-wider">TARGET · MOON</span>
             </div>
@@ -916,21 +773,18 @@ HTML_TEMPLATE = r"""
         </div>
     </div>
 
-    <!-- MODAL AJUSTES Y CALIBRACIÓN AVANZADA DE ALTURA -->
+    <!-- MODAL CONFIGURACIÓN -->
     <div id="settings-modal" class="fixed inset-0 z-[2000] bg-black/75 backdrop-blur-sm hidden items-center justify-center p-4">
         <div class="bg-slate-900 border border-slate-700 rounded-2xl p-4 max-w-sm w-full shadow-2xl flex flex-col gap-3 font-mono">
             <div class="flex justify-between items-center border-b border-slate-800 pb-2">
-                <h3 class="font-bold text-sm text-cyan-400">⚙️ Configuración & Calibración</h3>
+                <h3 class="font-bold text-sm text-cyan-400">⚙️ Calibración de Observación</h3>
                 <button onclick="toggleSettingsModal()" class="text-slate-400 hover:text-white font-bold">✕</button>
             </div>
             
-            <!-- GESTIÓN ORÓGRAFICA / ELEVACIÓN DEL OBSERVADOR -->
             <div class="flex flex-col gap-2 bg-slate-950 p-2.5 rounded-xl border border-slate-800">
                 <div class="flex justify-between items-center">
-                    <span class="text-[10px] text-slate-300 font-bold uppercase tracking-wider">⛰️ Cota del Terreno (MSL)</span>
-                    <button onclick="detectTerrainAuto()" class="text-[9px] px-1.5 py-0.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 rounded border border-cyan-800">
-                        Auto-Detect
-                    </button>
+                    <span class="text-[10px] text-slate-300 font-bold uppercase">⛰️ Terreno (MSL)</span>
+                    <button onclick="detectTerrainAuto()" class="text-[9px] px-2 py-0.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 rounded border border-cyan-800">Auto-Detect</button>
                 </div>
                 <div class="flex items-center gap-2">
                     <input id="terrain-elevation-input" type="number" step="1" oninput="calculateModalTotalAlt()" class="w-full bg-slate-900 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold tabular-nums">
@@ -938,34 +792,27 @@ HTML_TEMPLATE = r"""
                 </div>
 
                 <div class="flex justify-between items-center mt-1">
-                    <span class="text-[10px] text-slate-300 font-bold uppercase tracking-wider">🏢 Azotea / Trípode (Offset)</span>
+                    <span class="text-[10px] text-slate-300 font-bold uppercase">🏢 Trípode / Azotea (Offset)</span>
                 </div>
                 <div class="flex items-center gap-2">
                     <input id="building-offset" type="number" step="0.5" min="0" max="500" oninput="calculateModalTotalAlt()" class="w-full bg-slate-900 text-cyan-300 text-xs px-2 py-1.5 rounded border border-slate-700 font-bold tabular-nums">
                     <span class="text-slate-400 text-xs">m</span>
                 </div>
 
-                <div class="flex justify-between items-center pt-2 border-t border-slate-800/80 text-xs">
-                    <span class="text-slate-400 font-bold">Cota Total Efectiva:</span>
+                <div class="flex justify-between items-center pt-2 border-t border-slate-800 text-xs">
+                    <span class="text-slate-400 font-bold">Cota Total:</span>
                     <span id="total-alt-display" class="text-emerald-400 font-black tabular-nums">145m</span>
                 </div>
             </div>
 
-            <!-- PRUEBA DE AUDIO -->
             <div class="flex justify-between items-center bg-slate-950 p-2 rounded-xl border border-slate-800">
-                <span class="text-[10px] text-slate-300 font-bold">🔊 Sistema Acústico</span>
-                <button onclick="testAudioSystem()" class="px-2 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 border border-emerald-800 rounded text-[10px] font-bold">
-                    🔔 Test Audio
-                </button>
+                <span class="text-[10px] text-slate-300 font-bold">🔊 Audio Radar</span>
+                <button onclick="testAudioSystem()" class="px-2 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 border border-emerald-800 rounded text-[10px] font-bold">🔔 Probar</button>
             </div>
 
             <div class="flex justify-between items-center pt-2 border-t border-slate-800">
-                <button onclick="toggleMapLayer()" id="layer-btn" class="bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 font-bold transition">
-                    🗺️ Toggle Sat
-                </button>
-                <button onclick="saveAltitudeSettings()" class="bg-cyan-600 hover:bg-cyan-500 text-xs text-white px-4 py-1.5 rounded-lg font-bold transition">
-                    Guardar
-                </button>
+                <button onclick="toggleMapLayer()" id="layer-btn" class="bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 font-bold">🗺️ Toggle Sat</button>
+                <button onclick="saveAltitudeSettings()" class="bg-cyan-600 hover:bg-cyan-500 text-xs text-white px-4 py-1.5 rounded-lg font-bold">Guardar</button>
             </div>
         </div>
     </div>
@@ -980,18 +827,11 @@ HTML_TEMPLATE = r"""
         let userLeadSec = parseFloat(localStorage.getItem('user_lead_sec') || 6.0);
 
         let activeFilter = 'moon';
-        let viewMode = 'map';
-        let isLocationLocked = true;
         let serverClockDelta = 0.0;
+        let audioEnabled = true, voiceEnabled = true;
+        let audioContext = null, lastBeepedFlight = '';
         
-        // ALERTAS DE SONIDO Y VOZ ACTIVADAS POR DEFECTO
-        let audioEnabled = true;
-        let voiceEnabled = true;
-        let audioContext = null;
-        let lastBeepedFlight = '';
-        
-        let detectedTransits = new Set();
-        let spokenCountdowns = new Set();
+        let detectedTransits = new Set(), spokenCountdowns = new Set();
         let tcaSmoothedEpochs = {};
 
         let sunDataGlobal = { azimuth: 0, elevation: 0, visible: false, radius_deg: 0.26 };
@@ -1007,14 +847,9 @@ HTML_TEMPLATE = r"""
         const planesState = {};
         let activeAircraftData = [];
 
-        // Inicialización y desbloqueo transparente de AudioContext en el primer toque de pantalla
         function initAndUnlockAudio() {
-            if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            if (audioContext && audioContext.state === 'suspended') {
-                audioContext.resume();
-            }
+            if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioContext && audioContext.state === 'suspended') audioContext.resume();
         }
         ['click', 'touchstart', 'pointerdown', 'keydown'].forEach(ev => {
             window.addEventListener(ev, initAndUnlockAudio, { passive: true });
@@ -1024,11 +859,10 @@ HTML_TEMPLATE = r"""
         L.control.zoom({ position: 'bottomright' }).addTo(map);
 
         const cartoDarkLayer = L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png?key=${CARTO_KEY}`, {
-            subdomains: 'abcd', maxZoom: 20, attribution: '&copy; CARTO &bull; ADS-B: airplanes.live, adsb.lol, <a href="https://adsb.fi" target="_blank" rel="noopener">adsb.fi</a>'
+            subdomains: 'abcd', maxZoom: 20, attribution: '&copy; CARTO &bull; ADS-B OpenData'
         });
-
         const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            maxZoom: 18, attribution: 'Esri &bull; ADS-B: airplanes.live, adsb.lol, <a href="https://adsb.fi" target="_blank" rel="noopener">adsb.fi</a>'
+            maxZoom: 18, attribution: 'Esri &bull; ADS-B OpenData'
         });
 
         currentBaseTileLayer = cartoDarkLayer;
@@ -1036,14 +870,9 @@ HTML_TEMPLATE = r"""
 
         function toggleMapLayer() {
             map.removeLayer(currentBaseTileLayer);
-            if (!isSatelliteMode) {
-                currentBaseTileLayer = satelliteLayer;
-                document.getElementById('layer-btn').innerText = "🗺️ Basemap: Satellite HD";
-            } else {
-                currentBaseTileLayer = cartoDarkLayer;
-                document.getElementById('layer-btn').innerText = "🗺️ Basemap: Dark HD";
-            }
             isSatelliteMode = !isSatelliteMode;
+            currentBaseTileLayer = isSatelliteMode ? satelliteLayer : cartoDarkLayer;
+            document.getElementById('layer-btn').innerText = isSatelliteMode ? "🗺️ Basemap: Satellite" : "🗺️ Basemap: Dark";
             currentBaseTileLayer.addTo(map);
         }
 
@@ -1053,7 +882,7 @@ HTML_TEMPLATE = r"""
             iconSize: [44, 44], iconAnchor: [22, 22]
         });
 
-        obsMarker = L.marker([observerLat, observerLon], { draggable: false, icon: obsCustomIcon }).addTo(map);
+        obsMarker = L.marker([observerLat, observerLon], { draggable: true, icon: obsCustomIcon }).addTo(map);
 
         obsMarker.on('drag', function(e) {
             const pos = e.target.getLatLng();
@@ -1078,7 +907,7 @@ HTML_TEMPLATE = r"""
             rangeCircles = [];
             [15000, 30000, 50000].forEach((r) => {
                 const circle = L.circle([observerLat, observerLon], {
-                    radius: r, color: '#06b6d4', weight: 1, dashArray: '4, 8', fill: false, opacity: 0.22, interactive: false
+                    radius: r, color: '#06b6d4', weight: 1, dashArray: '4, 8', fill: false, opacity: 0.25, interactive: false
                 }).addTo(map);
                 rangeCircles.push(circle);
             });
@@ -1087,9 +916,7 @@ HTML_TEMPLATE = r"""
         function toggleSettingsModal() {
             const m = document.getElementById('settings-modal');
             m.classList.toggle('hidden'); m.classList.toggle('flex');
-            if (!m.classList.contains('hidden')) {
-                updateAltitudeDisplay();
-            }
+            if (!m.classList.contains('hidden')) updateAltitudeDisplay();
         }
 
         function calculateModalTotalAlt() {
@@ -1106,7 +933,6 @@ HTML_TEMPLATE = r"""
             
             localStorage.setItem('obs_terrain_m', terrainElevationM.toString());
             localStorage.setItem('obs_building_m', buildingOffsetM.toString());
-            
             updateAltitudeDisplay();
             fetchData();
             toggleSettingsModal();
@@ -1119,7 +945,7 @@ HTML_TEMPLATE = r"""
         function testAudioSystem() {
             initAndUnlockAudio();
             playChime();
-            speak("Audio and vocal alerts verified active");
+            speak("Radar audio and vocal alerts active");
         }
 
         function setFilterMode(mode) {
@@ -1166,9 +992,9 @@ HTML_TEMPLATE = r"""
                     const gain = audioContext.createGain();
                     osc.frequency.value = freq;
                     gain.gain.setValueAtTime(0.12, now + i * 0.08);
-                    gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.08 + 0.32);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.08 + 0.3);
                     osc.connect(gain); gain.connect(audioContext.destination);
-                    osc.start(now + i * 0.08); osc.stop(now + i * 0.08 + 0.32);
+                    osc.start(now + i * 0.08); osc.stop(now + i * 0.08 + 0.3);
                 });
             } catch (e) {}
         }
@@ -1180,7 +1006,7 @@ HTML_TEMPLATE = r"""
                 const osc = audioContext.createOscillator();
                 const gain = audioContext.createGain();
                 osc.frequency.value = freq;
-                gain.gain.setValueAtTime(0.16, audioContext.currentTime);
+                gain.gain.setValueAtTime(0.15, audioContext.currentTime);
                 gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + dur);
                 osc.connect(gain); gain.connect(audioContext.destination);
                 osc.start(); osc.stop(audioContext.currentTime + dur);
@@ -1262,42 +1088,35 @@ HTML_TEMPLATE = r"""
             return '#a855f7';
         }
 
+        // =====================================================================
+        // SILUETA AERONÁUTICA SIMPLIFICADA (LIGERA Y DE ALTO RENDIMIENTO)
+        // =====================================================================
+        function planeIconHtml(plane) {
+            const color = getAltitudeColor(plane.alt_ft);
+            const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
+            const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
+            const glow = anyT ? 'filter: drop-shadow(0 0 8px #ef4444);' : (anyC ? 'filter: drop-shadow(0 0 5px #f59e0b);' : 'filter: drop-shadow(0 1px 2px rgba(0,0,0,0.8));');
+            const lbl = (anyT || anyC) ? `<div style="position:absolute;left:28px;top:10px;white-space:nowrap;pointer-events:none;font:600 10px 'JetBrains Mono',monospace;padding:1px 5px;border-radius:4px;background:rgba(7,11,18,.9);border:1px solid ${anyT ? '#ef4444' : '#f59e0b'};color:${anyT ? '#fca5a5' : '#fcd34d'}">${plane.callsign}</div>` : '';
+
+            return `
+                <div style="position:relative;width:32px;height:32px;display:flex;align-items:center;justify-content:center;">
+                    <svg viewBox="0 0 24 24" width="26" height="26" style="transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${glow};">
+                        <path fill="${color}" stroke="#030712" stroke-width="0.75" stroke-linejoin="round" d="M12 2 L13.8 8.5 L22 13.5 L22 15.5 L13.8 13.2 L13.8 19.5 L16.2 21.2 L16.2 22.5 L12 21.5 L7.8 22.5 L7.8 21.2 L10.2 19.5 L10.2 13.2 L2 15.5 L2 13.5 L10.2 8.5 Z"/>
+                    </svg>
+                    ${lbl}
+                </div>
+            `;
+        }
+
         function getRealisticMoonSvgHtml(size = 38) {
             return `
-                <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 10px rgba(56,189,248,0.7));">
-                    <svg viewBox="0 0 100 100" width="${size}" height="${size}" style="overflow:visible;">
-                        <defs>
-                            <radialGradient id="lunarLimbGrad" cx="44%" cy="40%" r="56%">
-                                <stop offset="0%" stop-color="#f8fafc" />
-                                <stop offset="55%" stop-color="#e2e8f0" />
-                                <stop offset="82%" stop-color="#94a3b8" />
-                                <stop offset="100%" stop-color="#475569" />
-                            </radialGradient>
-                            <clipPath id="lunarSphereClip">
-                                <circle cx="50" cy="50" r="46" />
-                            </clipPath>
-                        </defs>
-                        <circle cx="50" cy="50" r="46" fill="url(#lunarLimbGrad)" stroke="#38bdf8" stroke-width="1.2"/>
-                        <g clip-path="url(#lunarSphereClip)">
-                            <path d="M 18,36 C 14,48 18,68 30,72 C 38,72 40,62 38,50 C 36,40 28,32 18,36 Z" fill="#334155" opacity="0.68"/>
-                            <circle cx="39" cy="34" r="12" fill="#334155" opacity="0.72"/>
-                            <circle cx="59" cy="35" r="8.5" fill="#334155" opacity="0.7"/>
-                            <ellipse cx="67" cy="48" rx="9" ry="8" fill="#334155" opacity="0.75"/>
-                            <ellipse cx="80" cy="38" rx="5.5" ry="4.5" fill="#1e293b" opacity="0.85"/>
-                            <ellipse cx="73" cy="60" rx="8" ry="7" fill="#334155" opacity="0.7"/>
-                            <circle cx="65" cy="63" r="5" fill="#334155" opacity="0.65"/>
-                            <ellipse cx="40" cy="64" rx="8" ry="7" fill="#334155" opacity="0.7"/>
-                            <circle cx="27" cy="63" r="4.5" fill="#334155" opacity="0.65"/>
-                            <line x1="48" y1="80" x2="30" y2="60" stroke="#ffffff" stroke-width="0.75" opacity="0.65"/>
-                            <line x1="48" y1="80" x2="68" y2="65" stroke="#ffffff" stroke-width="0.75" opacity="0.65"/>
-                            <line x1="48" y1="80" x2="48" y2="40" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
-                            <line x1="48" y1="80" x2="18" y2="82" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
-                            <line x1="48" y1="80" x2="76" y2="82" stroke="#ffffff" stroke-width="0.6" opacity="0.55"/>
-                            <circle cx="48" cy="80" r="2.4" fill="#ffffff"/>
-                            <circle cx="36" cy="44" r="2.2" fill="#ffffff" opacity="0.95"/>
-                            <circle cx="26" cy="45" r="1.6" fill="#ffffff" opacity="0.9"/>
-                            <circle cx="24" cy="33" r="1.8" fill="#ffffff" opacity="1.0"/>
-                        </g>
+                <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 8px rgba(56,189,248,0.7));">
+                    <svg viewBox="0 0 100 100" width="${size}" height="${size}">
+                        <circle cx="50" cy="50" r="46" fill="#cbd5e1" stroke="#38bdf8" stroke-width="1.5"/>
+                        <circle cx="38" cy="35" r="10" fill="#64748b" opacity="0.6"/>
+                        <circle cx="62" cy="38" r="8" fill="#64748b" opacity="0.6"/>
+                        <ellipse cx="60" cy="62" rx="9" ry="8" fill="#64748b" opacity="0.6"/>
+                        <circle cx="36" cy="64" r="6" fill="#64748b" opacity="0.6"/>
                     </svg>
                 </div>
             `;
@@ -1305,20 +1124,10 @@ HTML_TEMPLATE = r"""
 
         function getRealisticSunSvgHtml(size = 38) {
             return `
-                <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 12px rgba(245,158,11,0.9));">
-                    <svg viewBox="0 0 100 100" width="${size}" height="${size}" style="overflow:visible;">
-                        <defs>
-                            <radialGradient id="solarDiscGrad" cx="45%" cy="45%" r="55%">
-                                <stop offset="0%" stop-color="#fffbeb" />
-                                <stop offset="60%" stop-color="#fbbf24" />
-                                <stop offset="90%" stop-color="#f59e0b" />
-                                <stop offset="100%" stop-color="#d97706" />
-                            </radialGradient>
-                        </defs>
+                <div style="position:relative; width:${size}px; height:${size}px; display:flex; align-items:center; justify-content:center; filter: drop-shadow(0 0 10px rgba(245,158,11,0.85));">
+                    <svg viewBox="0 0 100 100" width="${size}" height="${size}">
                         <circle cx="50" cy="50" r="44" fill="none" stroke="#fef08a" stroke-width="1.5" stroke-dasharray="4, 4" opacity="0.8" />
-                        <circle cx="50" cy="50" r="38" fill="url(#solarDiscGrad)" stroke="#fde047" stroke-width="1.8" />
-                        <ellipse cx="44" cy="42" rx="2" ry="1.5" fill="#78350f" opacity="0.75"/>
-                        <ellipse cx="58" cy="46" rx="2.5" ry="1.8" fill="#78350f" opacity="0.75"/>
+                        <circle cx="50" cy="50" r="38" fill="#f59e0b" stroke="#fde047" stroke-width="2" />
                     </svg>
                 </div>
             `;
@@ -1335,18 +1144,11 @@ HTML_TEMPLATE = r"""
                     observerLat + (distKm * Math.cos(radAzM)) / 111.0,
                     observerLon + (distKm * Math.sin(radAzM)) / (111.0 * Math.cos(observerLat * Math.PI / 180))
                 ];
-                if (moonLine) {
-                    moonLine.setLatLngs([[observerLat, observerLon], endM]);
-                } else {
-                    moonLine = L.polyline([[observerLat, observerLon], endM], { color: '#38bdf8', weight: 2.2, dashArray: '5, 8', opacity: 0.95 }).addTo(map);
-                }
-                if (moonIconMarker) {
-                    moonIconMarker.setLatLng(endM);
-                } else {
-                    moonIconMarker = L.marker(endM, { 
-                        icon: L.divIcon({ className: '', html: getRealisticMoonSvgHtml(38), iconSize: [38, 38], iconAnchor: [19, 19] }) 
-                    }).addTo(map);
-                }
+                if (moonLine) moonLine.setLatLngs([[observerLat, observerLon], endM]);
+                else moonLine = L.polyline([[observerLat, observerLon], endM], { color: '#38bdf8', weight: 2.2, dashArray: '5, 8', opacity: 0.95 }).addTo(map);
+                
+                if (moonIconMarker) moonIconMarker.setLatLng(endM);
+                else moonIconMarker = L.marker(endM, { icon: L.divIcon({ html: getRealisticMoonSvgHtml(36), iconSize: [36, 36], iconAnchor: [18, 18] }) }).addTo(map);
             } else {
                 if (moonLine) { map.removeLayer(moonLine); moonLine = null; }
                 if (moonIconMarker) { map.removeLayer(moonIconMarker); moonIconMarker = null; }
@@ -1358,214 +1160,105 @@ HTML_TEMPLATE = r"""
                     observerLat + (distKm * Math.cos(radAzS)) / 111.0,
                     observerLon + (distKm * Math.sin(radAzS)) / (111.0 * Math.cos(observerLat * Math.PI / 180))
                 ];
-                if (sunLine) {
-                    sunLine.setLatLngs([[observerLat, observerLon], endS]);
-                } else {
-                    sunLine = L.polyline([[observerLat, observerLon], endS], { color: '#f59e0b', weight: 2.2, dashArray: '5, 8', opacity: 0.95 }).addTo(map);
-                }
-                if (sunIconMarker) {
-                    sunIconMarker.setLatLng(endS);
-                } else {
-                    sunIconMarker = L.marker(endS, { 
-                        icon: L.divIcon({ className: '', html: getRealisticSunSvgHtml(38), iconSize: [38, 38], iconAnchor: [19, 19] }) 
-                    }).addTo(map);
-                }
+                if (sunLine) sunLine.setLatLngs([[observerLat, observerLon], endS]);
+                else sunLine = L.polyline([[observerLat, observerLon], endS], { color: '#f59e0b', weight: 2.2, dashArray: '5, 8', opacity: 0.95 }).addTo(map);
+
+                if (sunIconMarker) sunIconMarker.setLatLng(endS);
+                else sunIconMarker = L.marker(endS, { icon: L.divIcon({ html: getRealisticSunSvgHtml(36), iconSize: [36, 36], iconAnchor: [18, 18] }) }).addTo(map);
             } else {
                 if (sunLine) { map.removeLayer(sunLine); sunLine = null; }
                 if (sunIconMarker) { map.removeLayer(sunIconMarker); sunIconMarker = null; }
             }
         }
 
-        // ---------- Sincronización de reloj tipo NTP (muestra de menor RTT) ----------
-        let syncRtt = null;
-        async function syncClock(n = 5) {
-            if (syncRtt !== null) syncRtt *= 1.2;
-            for (let i = 0; i < n; i++) {
-                try {
-                    const t0 = Date.now() / 1000.0;
-                    const r = await fetch('/api/time?i=' + i, { cache: 'no-store' });
-                    const j = await r.json();
-                    const t1 = Date.now() / 1000.0;
-                    const rtt = t1 - t0;
-                    const off = (t0 + t1) / 2.0 - j.t;
-                    if (syncRtt === null || rtt <= syncRtt * 1.3 + 0.01) {
-                        serverClockDelta = (syncRtt === null) ? off : serverClockDelta * 0.6 + off * 0.4;
-                        syncRtt = (syncRtt === null) ? rtt : Math.min(rtt, syncRtt * 1.05);
-                    }
-                } catch (e) {}
-                await new Promise(res => setTimeout(res, 120));
-            }
-            const b = document.getElementById('sync-badge');
-            if (b && syncRtt !== null) b.innerText = `SYNC ±${Math.max(1, Math.round(syncRtt * 500))}ms`;
+        async function syncClock() {
+            try {
+                const t0 = Date.now() / 1000.0;
+                const r = await fetch('/api/time', { cache: 'no-store' });
+                const j = await r.json();
+                const t1 = Date.now() / 1000.0;
+                serverClockDelta = (t0 + t1) / 2.0 - j.t;
+                document.getElementById('sync-badge').innerText = `SYNC ±${Math.max(1, Math.round((t1 - t0) * 500))}ms`;
+            } catch (e) {}
         }
         const syncedNow = () => (Date.now() / 1000.0) - serverClockDelta;
 
         function projectLL(lat, lon, speedMs, trackRad, dt) {
             const d = speedMs * dt;
-            return [lat + (d * Math.cos(trackRad)) / 111139.0,
-                    lon + (d * Math.sin(trackRad)) / (111139.0 * Math.cos(lat * Math.PI / 180.0))];
-        }
-
-        // ---------- Siluetas por familia de aeronave (vista cenital, norte arriba) ----------
-        const AC_RULES = [
-            ['heli', /^(H\d\d|H500|EC\d\d|AS\d\d|R22|R44|R66|B06|B07|B40\d|B41\d|B42\d|S76|S92|S61|AW\d\d|A109|A119|A139|A169|A189|MD\d\d$|BK17|EN28|NH90|UH\d|CH\d|MI\d|KA\d)/],
-            ['quad', /^(A388|B744|B748|B74S|B74R|A342|A343|A345|A346|IL96|C17|A124|B52|K35R|E3TF|E3CF)$/],
-            ['tp4', /^(A400|C130|C30J|C160|AN12|P3)$/],
-            ['wide', /^(A306|A30B|A310|A332|A333|A338|A339|A359|A35K|B762|B763|B764|B772|B773|B77L|B77W|B778|B779|B788|B789|B78X|MD11|DC10|IL86|A3ST)$/],
-            ['tp', /^(AT\d\d|ATP|DH8[A-D]|DHC\d|SF34|JS\d\d|SW\d|B190|E120|F50|F27|PC12|C208|C212|CN35|AN2\d?|BE9\w|BE20|BE30|TBM\d|P180|PAY\d)/],
-            ['rear', /^(CRJ\d|CRJX|E13\d|E14\d|E45X|F28|F70|F100|B72\d|B712|MD8\d|MD9\d|DC9\w?|BAE\d|RJ\d\d|J328|T154|T134|B46\d|SU95)/],
-            ['biz', /^(C25\w|C5\d\w|C6\d\w|C68\w|C700|C750|LJ\d\d|GL\d\w|GLF\d|GLEX|G\d{3}$|FA\d\w|F2TH|F900|E50P|E55P|H25\w|CL\d\d|PRM1|SF50|BE40|HDJT|EA50|LEG\d|PC24|ASTR|WW24|E545|E550)/],
-            ['light', /^(C1\d\d|C2\d\d$|C[0-9]{2}[A-Z]$|PA\d\d|P28\w|P32\w|SR2\d|DA\d\d|DV20|BE3\d|BE5\d|BE6\d|M20\w|TB\d\d|AA5|RV\d|G115|ROBN|PIVI|S22T|COZY|DR40|AC\d\w|MO\d)/],
-        ];
-        const AC_PROFILE = {
-            narrow: { len: 56, fw: 3.8, span: 15,   wy: 23, sw: 8,   root: 8,   tip: 2.6, eng: [5.8],       tail: 6.5, tOff: 12, size: 30 },
-            wide:   { len: 60, fw: 4.8, span: 19.5, wy: 21, sw: 11,  root: 10.5, tip: 3,  eng: [7.4],       tail: 7.5, tOff: 12, size: 36 },
-            quad:   { len: 62, fw: 5,   span: 20.5, wy: 21, sw: 12,  root: 11,  tip: 3,   eng: [6.4, 11.6], tail: 8,   tOff: 12, size: 40 },
-            rear:   { len: 50, fw: 3.3, span: 12.5, wy: 25, sw: 6,   root: 7,   tip: 2.4, rear: 1.9,        tail: 5.5, tOff: 8,  size: 27 },
-            biz:    { len: 40, fw: 2.8, span: 10.5, wy: 24, sw: 6,   root: 6,   tip: 2,   rear: 1.7,        tail: 4.5, tOff: 7,  size: 23 },
-            tp:     { len: 46, fw: 3.6, span: 17,   wy: 22, sw: 0.8, root: 5.5, tip: 4,   eng: [6.5],       tail: 6.5, tOff: 9,  size: 28, prop: 1 },
-            tp4:    { len: 50, fw: 4.4, span: 22,   wy: 22, sw: 1,   root: 7,   tip: 5,   eng: [6.5, 12],  tail: 8,   tOff: 9,  size: 38, prop: 1 },
-            light:  { len: 32, fw: 2.4, span: 14,   wy: 25, sw: 0,   root: 6,   tip: 5,   nose: 1,         tail: 5,   tOff: 6,  size: 21, prop: 1 }
-        };
-        function acKind(model) {
-            const m = (model || '').toUpperCase();
-            for (const [k, re] of AC_RULES) if (re.test(m)) return k;
-            return 'narrow';
-        }
-        function aircraftSvg(kind, fill) {
-            const ST = 'stroke="#04080f" stroke-width="1" stroke-linejoin="round"';
-            if (kind === 'heli') {
-                return `<svg viewBox="0 0 64 64" width="30" height="30" style="overflow:visible">
-                    <rect x="31" y="44" width="2" height="16" fill="${fill}" ${ST}/><rect x="28.5" y="58" width="7" height="2" fill="${fill}" ${ST}/>
-                    <ellipse cx="32" cy="36" rx="5" ry="10" fill="${fill}" ${ST}/>
-                    <circle cx="32" cy="36" r="23" fill="${fill}" opacity=".08"/>
-                    <g style="transform-origin:32px 36px;animation:rotor .45s linear infinite">
-                    <line x1="9" y1="36" x2="55" y2="36" stroke="${fill}" stroke-width="1.6" opacity=".85"/><line x1="32" y1="13" x2="32" y2="59" stroke="${fill}" stroke-width="1.6" opacity=".85"/></g></svg>`;
-            }
-            const P = AC_PROFILE[kind] || AC_PROFILE.narrow, c = 32, f = P.fw / 2;
-            const y0 = 32 - P.len / 2, y1 = 32 + P.len / 2, ty = y1 - P.tOff;
-            const fus = `M${c} ${y0} C${c+f} ${y0} ${c+f} ${y0+5} ${c+f} ${y0+10} L${c+f} ${y1-9} L${c+f*.3} ${y1} L${c-f*.3} ${y1} L${c-f} ${y1-9} L${c-f} ${y0+10} C${c-f} ${y0+5} ${c-f} ${y0} ${c} ${y0}Z`;
-            const wing = s => `M${c+s*f} ${P.wy} L${c+s*P.span} ${P.wy+P.sw} L${c+s*P.span} ${P.wy+P.sw+P.tip} L${c+s*f} ${P.wy+P.root}Z`;
-            const tail = s => `M${c+s*f} ${ty} L${c+s*P.tail} ${ty+2.2} L${c+s*P.tail} ${ty+4} L${c+s*f} ${ty+5.2}Z`;
-            let eng = '';
-            (P.eng || []).forEach(x => [-1, 1].forEach(s => {
-                const cy = P.wy + P.sw * (x - f) / (P.span - f) - 0.5, cx = c + s * x;
-                eng += `<ellipse cx="${cx}" cy="${cy}" rx="${P.prop ? 1.5 : 1.7}" ry="${P.prop ? 5 : 4.2}" fill="${fill}" ${ST}/>`;
-                if (P.prop) eng += `<ellipse cx="${cx}" cy="${cy - 5.4}" rx="3.6" ry=".7" fill="${fill}" opacity=".55"/>`;
-            }));
-            if (P.rear) [-1, 1].forEach(s => { eng += `<ellipse cx="${c + s * (f + P.rear)}" cy="${y1 - 14}" rx="1.5" ry="4" fill="${fill}" ${ST}/>`; });
-            if (P.nose) eng += `<ellipse cx="${c}" cy="${y0 - 0.5}" rx="5" ry=".8" fill="${fill}" opacity=".55"/>`;
-            return `<svg viewBox="0 0 64 64" width="${P.size}" height="${P.size}" style="overflow:visible">
-                <path d="${wing(-1)}" fill="${fill}" ${ST}/><path d="${wing(1)}" fill="${fill}" ${ST}/>
-                <path d="${tail(-1)}" fill="${fill}" ${ST}/><path d="${tail(1)}" fill="${fill}" ${ST}/>
-                ${eng}<path d="${fus}" fill="${fill}" ${ST}/>
-                <path d="M${c-f*.55} ${y0+4.5} Q${c} ${y0+2.6} ${c+f*.55} ${y0+4.5} L${c+f*.4} ${y0+6.2} L${c-f*.4} ${y0+6.2}Z" fill="#04080f" opacity=".55"/></svg>`;
-        }
-
-        function planeIconHtml(plane) {
-            const color = getAltitudeColor(plane.alt_ft);
-            const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
-            const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
-            const glow = anyT ? 'filter: drop-shadow(0 0 8px #ef4444);' : (anyC ? 'filter: drop-shadow(0 0 6px #f59e0b);' : 'filter: drop-shadow(0 1px 2px rgba(0,0,0,.7));');
-            const lbl = (anyT || anyC) ? `<div style="position:absolute;left:36px;top:15px;white-space:nowrap;pointer-events:none;font:600 10px 'JetBrains Mono',monospace;padding:1px 5px;border-radius:4px;background:rgba(7,11,18,.88);border:1px solid ${anyT ? '#ef4444' : '#f59e0b'};color:${anyT ? '#fca5a5' : '#fcd34d'}">${plane.callsign}</div>` : '';
-            return `<div style="position:relative;width:44px;height:44px">
-                <div style="transform: rotate(${plane.track}deg); width:44px; height:44px; display:flex; align-items:center; justify-content:center; ${glow}">${aircraftSvg(acKind(plane.model), color)}</div>${lbl}</div>`;
+            return [
+                lat + (d * Math.cos(trackRad)) / 111139.0,
+                lon + (d * Math.sin(trackRad)) / (111139.0 * Math.cos(lat * Math.PI / 180.0))
+            ];
         }
 
         function popupHtml(p) {
             const arrow = p.vr_fpm > 300 ? '▲' : (p.vr_fpm < -300 ? '▼' : '►');
-            return `<div><b style="color:#7dd3fc">${p.callsign}</b> · ${p.model}${p.reg ? ' · ' + p.reg : ''}<br>
+            return `<div class="font-mono text-xs">
+                <b class="text-cyan-400 font-bold">${p.callsign}</b> · ${p.model}<br>
                 ALT ${p.alt_ft.toLocaleString()} ft ${p.alt_type} ${arrow} ${p.vr_fpm} ft/m<br>
-                GS ${p.speed_kt} kt · HDG ${p.track}°<br>DIST ${p.distance_km} km · SPAN ${p.wingspan_m} m</div>`;
+                GS ${p.speed_kt} kt · HDG ${p.track}°<br>DIST ${p.distance_km} km
+            </div>`;
         }
 
-        // ---------- Petición de datos: nunca solapada, nunca fuera de orden ----------
-        let feedNote = '';
-        let fetchSeq = 0, appliedSeq = 0, fetchBusy = false, fetchQueued = false;
+        let fetchBusy = false;
         async function fetchData() {
-            if (fetchBusy) { fetchQueued = true; return; }
+            if (fetchBusy) return;
             fetchBusy = true;
-            const seq = ++fetchSeq;
-            const ctl = new AbortController();
-            const to = setTimeout(() => ctl.abort(), 10000);
-            const feed = document.getElementById('feed-badge');
+            const feedBadge = document.getElementById('feed-badge');
             try {
-                const totalObserverAlt = Math.round(terrainElevationM + buildingOffsetM);
-                const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalObserverAlt}&lead=${userLeadSec}`, { cache: 'no-store', signal: ctl.signal });
+                const totalAlt = Math.round(terrainElevationM + buildingOffsetM);
+                const res = await fetch(`/api/data?lat=${observerLat}&lon=${observerLon}&alt=${totalAlt}&lead=${userLeadSec}`, { cache: 'no-store' });
                 const data = await res.json();
-                if (data.error || !data.moon) {
-                    feedNote = 'error de servidor: ' + (data.error || 'respuesta vacía');
-                    feed.dataset.state = 'bad'; feed.innerText = 'SERVER ERROR'; updateHUDCountdowns(); return;
+                if (data.error) {
+                    feedBadge.dataset.state = 'bad';
+                    feedBadge.innerText = 'FEED ERROR';
+                    return;
                 }
-                if (seq < appliedSeq) return;
-                appliedSeq = seq;
-                feed.dataset.state = 'ok';
+                feedBadge.dataset.state = 'ok';
+                feedBadge.innerText = (data.source_feed || 'ONLINE').toUpperCase();
                 applyData(data);
             } catch (err) {
-                feed.dataset.state = 'bad'; feed.innerText = 'RECONNECTING';
+                feedBadge.dataset.state = 'bad';
+                feedBadge.innerText = 'OFFLINE';
             } finally {
-                clearTimeout(to);
                 fetchBusy = false;
-                if (fetchQueued) { fetchQueued = false; setTimeout(fetchData, 0); }
             }
         }
 
         function applyData(data) {
             moonDataGlobal = data.moon;
             sunDataGlobal = data.sun;
-            feedNote = data.feed_note || '';
-            const fb = document.getElementById('feed-badge'), fa = data.feed_age_s;
-            fb.innerText = (data.source_feed || 'FEED').toUpperCase() + (fa !== undefined ? ` · ${fa.toFixed(1)}s` : '');
-            fb.dataset.state = (fa !== undefined && fa > 8) ? 'bad' : 'ok';
 
-            const mCoords = document.getElementById('moon-coords');
-            const mBadge = document.getElementById('moon-badge');
-            mCoords.innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
-            mBadge.innerText = `${moonDataGlobal.event_type}: ${moonDataGlobal.next_event_str}`;
-            const sCoords = document.getElementById('sun-coords');
-            const sBadge = document.getElementById('sun-badge');
-            sCoords.innerText = sunDataGlobal.visible ? `Sun: Az ${sunDataGlobal.azimuth}° | Alt +${sunDataGlobal.elevation}°` : `Sun Hidden (${sunDataGlobal.elevation}°)`;
-            sBadge.innerText = `${sunDataGlobal.event_type}: ${sunDataGlobal.next_event_str}`;
+            document.getElementById('moon-coords').innerText = moonDataGlobal.visible ? `Moon: Az ${moonDataGlobal.azimuth}° | Alt +${moonDataGlobal.elevation}°` : `Moon Hidden (${moonDataGlobal.elevation}°)`;
+            document.getElementById('moon-badge').innerText = `${moonDataGlobal.event_type}: ${moonDataGlobal.next_event_str}`;
+            document.getElementById('sun-coords').innerText = sunDataGlobal.visible ? `Sun: Az ${sunDataGlobal.azimuth}° | Alt +${sunDataGlobal.elevation}°` : `Sun Hidden (${sunDataGlobal.elevation}°)`;
+            document.getElementById('sun-badge').innerText = `${sunDataGlobal.event_type}: ${sunDataGlobal.next_event_str}`;
             renderAstroVectors();
 
             activeAircraftData = data.aircraft || [];
             document.getElementById('plane-count').innerText = activeAircraftData.length;
-            const tRef = data.server_time;      // instante al que corresponden lat/lon recibidos
+            const tRef = data.server_time;
             const nowSec = syncedNow();
             const seenKeys = new Set();
 
             activeAircraftData.forEach(plane => {
-                const k = plane._k = plane.callsign + '|' + plane.reg;
+                const k = plane._k = plane.callsign;
                 seenKeys.add(k);
-                const target = activeFilter === 'sun' ? plane.sun : (activeFilter === 'moon' ? plane.moon : plane.primary);
-
-                // Suavizado mínimo del TCA: solo amortigua jitter < 0.3 s, nunca introduce retardo en cambios reales
-                const prev = tcaSmoothedEpochs[k], cur = target.tca_epoch;
-                tcaSmoothedEpochs[k] = (prev && Math.abs(cur - prev) < 0.3) ? prev * 0.5 + cur * 0.5 : cur;
-
                 const trackRad = (plane.track * Math.PI) / 180.0;
-                const sig = Math.round(plane.track) + '|' + getAltitudeColor(plane.alt_ft) + '|' + plane.moon.is_transit + plane.sun.is_transit + plane.moon.is_close + plane.sun.is_close;
                 const [pl, po] = projectLL(plane.lat, plane.lon, plane.speed_ms, trackRad, Math.max(-1, Math.min(8, nowSec - tRef)));
                 let st = planesState[k];
 
                 if (!st) {
-                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [44, 44], iconAnchor: [22, 22] }) }).addTo(map);
+                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }) }).addTo(map);
                     marker.bindPopup(popupHtml(plane));
-                    st = planesState[k] = { marker, curLat: pl, curLon: po, errN: 0, errE: 0, iconSig: sig };
+                    st = planesState[k] = { marker, curLat: pl, curLon: po };
                 } else {
-                    // Corrección suave: el error entre lo dibujado y la nueva predicción decae en ~0.6 s (sin saltos)
-                    const eN = (st.curLat - pl) * 111139.0;
-                    const eE = (st.curLon - po) * 111139.0 * Math.cos(pl * Math.PI / 180.0);
-                    if (Math.hypot(eN, eE) < 1500) { st.errN = eN; st.errE = eE; } else { st.errN = 0; st.errE = 0; }
-                    if (st.iconSig !== sig) {
-                        st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [44, 44], iconAnchor: [22, 22] }));
-                        st.iconSig = sig;
-                    }
+                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }));
                     st.marker.setPopupContent(popupHtml(plane));
                 }
                 st.baseLat = plane.lat; st.baseLon = plane.lon; st.tRef = tRef;
                 st.speedMs = plane.speed_ms; st.trackRad = trackRad;
-                st.lastSeen = nowSec; st.data = plane;
+                st.lastSeen = nowSec;
             });
 
             for (const k in planesState) {
@@ -1578,67 +1271,29 @@ HTML_TEMPLATE = r"""
             updateHUDCountdowns();
         }
 
-        // ---------- Animación: posición absoluta = base + v·(t_sync − t_ref), sin acumular deriva ----------
-        let lastAnimTime = performance.now();
+        let lastAnim = performance.now();
         function animateFrame(nowMs) {
-            const dtF = Math.min(0.1, Math.max(0.001, (nowMs - lastAnimTime) / 1000.0));
-            lastAnimTime = nowMs;
+            lastAnim = nowMs;
             const now = syncedNow();
-            const decay = Math.exp(-dtF / 0.6);
             for (const k in planesState) {
                 const p = planesState[k];
                 if (p.baseLat === undefined) continue;
                 const [la, lo] = projectLL(p.baseLat, p.baseLon, p.speedMs, p.trackRad, Math.max(-1.0, Math.min(8.0, now - p.tRef)));
-                p.errN *= decay; p.errE *= decay;
-                p.curLat = la + p.errN / 111139.0;
-                p.curLon = lo + p.errE / (111139.0 * Math.cos(la * Math.PI / 180.0));
-                p.marker.setLatLng([p.curLat, p.curLon]);
+                p.curLat = la; p.curLon = lo;
+                p.marker.setLatLng([la, lo]);
             }
             requestAnimationFrame(animateFrame);
-        }
-
-        function renderTransitDiscDiagram(target) {
-            const isSun = target.target === 'sun';
-            const bodyColor = isSun ? '#fbbf24' : '#38bdf8';
-            const bodyRad = isSun ? (sunDataGlobal.radius_deg || 0.26) : (moonDataGlobal.radius_deg || 0.26);
-            const normOffset = Math.max(-1.7, Math.min(1.7, target.vertical_offset_deg / Math.max(0.01, bodyRad)));
-            const chordY = 24 - (normOffset * 11);
-
-            return `
-                <div class="flex items-center gap-2.5 bg-slate-950/90 p-2 rounded-lg border border-slate-800/90 mt-1 shadow-inner">
-                    <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0 select-none">
-                        <circle cx="24" cy="24" r="22" fill="none" stroke="#1e293b" stroke-width="1"/>
-                        <circle cx="24" cy="24" r="18" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.4"/>
-                        <line x1="4" y1="24" x2="44" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <line x1="24" y1="4" x2="24" y2="44" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
-                        <line x1="24" y1="2" x2="24" y2="6" stroke="${bodyColor}" stroke-width="1.2"/>
-                        <line x1="24" y1="42" x2="24" y2="46" stroke="${bodyColor}" stroke-width="1.2"/>
-                        <line x1="2" y1="24" x2="6" y2="24" stroke="${bodyColor}" stroke-width="1.2"/>
-                        <line x1="42" y1="24" x2="46" y2="24" stroke="${bodyColor}" stroke-width="1.2"/>
-                        <line x1="2" y1="${chordY.toFixed(1)}" x2="46" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
-                    </svg>
-                    <div class="flex flex-col text-[10px] leading-tight font-mono">
-                        <div class="flex items-center gap-1">
-                            <span class="text-slate-500 uppercase font-bold tracking-wider text-[8px]">CHORD:</span>
-                            <span class="font-bold ${target.is_transit ? 'text-red-400' : 'text-amber-400'}">${target.position_descriptor}</span>
-                        </div>
-                        <span class="text-slate-400 mt-0.5">Offset: <b class="text-slate-200 tabular-nums">${target.vertical_offset_deg > 0 ? '+' : ''}${target.vertical_offset_deg}°</b> (${target.vertical_body_diams} diam.)</span>
-                        <span class="text-slate-400">Coverage: <b class="text-indigo-300 tabular-nums">${target.disk_coverage_pct}%</b> (${target.transit_duration_s}s dur.)</span>
-                    </div>
-                </div>
-            `;
         }
 
         function updateHUDCountdowns() {
             const container = document.getElementById('alerts-container');
             if (!activeAircraftData || activeAircraftData.length === 0) {
-                container.innerHTML = `<div class="text-xs text-slate-500 text-center py-8 font-mono">${feedNote ? 'Sin datos ADS-B · ' + feedNote + '<br><span class="text-slate-600">Detalle en /api/status</span>' : 'Scanning airspace for transit intercept...'}</div>`;
+                container.innerHTML = `<div class="text-xs text-slate-500 text-center py-8 font-mono">Scanning airspace for transit intercept...</div>`;
                 clearTcaTrajectory();
                 return;
             }
 
-            const now = (Date.now() / 1000.0) - serverClockDelta;
-            
+            const now = syncedNow();
             let displayList = activeAircraftData.map(p => {
                 let targetData = p.moon;
                 if (activeFilter === 'sun') targetData = p.sun;
@@ -1658,18 +1313,17 @@ HTML_TEMPLATE = r"""
 
                 const isTransit = target.is_transit && isTargetVisible;
                 const isClose = target.is_close && isTargetVisible;
-                const sym = target.target === 'sun' ? '☀️' : '🌕';
 
                 const mins = Math.floor(remaining / 60);
                 const secs = (remaining % 60).toFixed(1).padStart(4, '0');
                 const timerStr = remaining > 0 ? `T-${mins.toString().padStart(2, '0')}:${secs}` : `TRANSITING!`;
 
                 let cardBorder = 'border-slate-800/80 bg-slate-950/60';
-                let tagHtml = `<span class="bg-slate-900 text-slate-400 border border-slate-800 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">EN ROUTE</span>`;
+                let tagHtml = `<span class="bg-slate-900 text-slate-400 border border-slate-800 px-1.5 py-0.5 rounded text-[8px] font-bold font-mono">EN ROUTE</span>`;
 
                 if (isTransit) {
                     cardBorder = 'border-red-500/90 bg-red-950/60 glow-red';
-                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[8px] font-black font-mono tracking-wider animate-pulse">TRANSIT LOCK</span>`;
+                    tagHtml = `<span class="bg-red-600 text-white px-2 py-0.5 rounded text-[8px] font-black font-mono animate-pulse">TRANSIT LOCK</span>`;
                     
                     if (!priorityTransitFound && remaining > 0) {
                         priorityTransitFound = true;
@@ -1677,7 +1331,6 @@ HTML_TEMPLATE = r"""
                     }
 
                     const flightKey = `${plane.callsign}-${target.target}`;
-
                     if (!detectedTransits.has(flightKey)) {
                         detectedTransits.add(flightKey);
                         playChime();
@@ -1686,21 +1339,11 @@ HTML_TEMPLATE = r"""
 
                     const wholeSec = Math.floor(remaining);
                     const alertKey = `${flightKey}-${wholeSec}`;
-
                     if (!spokenCountdowns.has(alertKey) && remaining > 0) {
-                        if (wholeSec === 180) {
-                            spokenCountdowns.add(alertKey); playChime(); speak("Transit in 3 minutes");
-                        } else if (wholeSec === 120) {
-                            spokenCountdowns.add(alertKey); playChime(); speak("Transit in 2 minutes, prepare gear");
-                        } else if (wholeSec === 60) {
-                            spokenCountdowns.add(alertKey); playChime(); speak("Warning: transit in 60 seconds");
-                        } else if (wholeSec === 30) {
-                            spokenCountdowns.add(alertKey); speak("30 seconds");
-                        } else if (wholeSec === 10) {
-                            spokenCountdowns.add(alertKey); speak("10 seconds");
-                        } else if ([5, 4, 3, 2, 1].includes(wholeSec)) {
-                            spokenCountdowns.add(alertKey); playTone(1050 + (5 - wholeSec) * 140, 0.1);
-                        }
+                        if (wholeSec === 180) { spokenCountdowns.add(alertKey); playChime(); speak("Transit in 3 minutes"); }
+                        else if (wholeSec === 60) { spokenCountdowns.add(alertKey); playChime(); speak("Warning, transit in 60 seconds"); }
+                        else if (wholeSec === 10) { spokenCountdowns.add(alertKey); speak("10 seconds"); }
+                        else if ([5, 4, 3, 2, 1].includes(wholeSec)) { spokenCountdowns.add(alertKey); playTone(1100 + (5 - wholeSec) * 120, 0.08); }
                     }
 
                     if (remaining <= 0.2 && lastBeepedFlight !== flightKey) {
@@ -1709,7 +1352,7 @@ HTML_TEMPLATE = r"""
                     }
                 } else if (isClose) {
                     cardBorder = 'border-amber-500/80 bg-amber-950/50 glow-amber';
-                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono tracking-wider">CLOSE PASS</span>`;
+                    tagHtml = `<span class="bg-amber-600 text-white px-2 py-0.5 rounded text-[8px] font-bold font-mono">CLOSE PASS</span>`;
                     if (!priorityTransitFound && remaining > 0 && remaining < 180) {
                         priorityTransitFound = true;
                         renderTcaTrajectory(plane, target);
@@ -1717,38 +1360,31 @@ HTML_TEMPLATE = r"""
                 }
 
                 html += `
-                    <div onclick="focusPlane('${plane._k}')" 
-                         class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1.5 transition cursor-pointer hud-card">
-                        
-                        <div class="flex justify-between items-center border-b border-slate-800/80 pb-1.5 font-mono">
+                    <div onclick="focusPlane('${plane._k}')" class="p-2.5 rounded-xl border ${cardBorder} text-xs flex flex-col gap-1.5 cursor-pointer hud-card">
+                        <div class="flex justify-between items-center border-b border-slate-800 pb-1.5 font-mono">
                             <div class="flex items-center gap-1.5">
-                                <span class="font-black text-sm tracking-wide ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
+                                <span class="font-black text-sm ${isTransit ? 'text-red-400' : 'text-slate-100'}">${plane.callsign}</span>
                                 <span class="px-1.5 py-0.2 bg-slate-900 text-cyan-300 border border-slate-700 rounded text-[9px] font-bold">${plane.model}</span>
-                                <span class="text-[8px] px-1 bg-slate-900 text-slate-400 border border-slate-800 rounded">${plane.alt_type}</span>
                             </div>
                             ${tagHtml}
                         </div>
-                        
                         <div class="grid grid-cols-3 gap-1.5 items-center font-mono my-0.5">
-                            <div class="col-span-1 px-2 py-1 rounded bg-slate-950 border ${isTransit ? 'border-red-500/80 text-red-400' : (isClose ? 'border-amber-500/80 text-amber-400' : 'border-slate-800 text-cyan-400')} flex flex-col items-center justify-center">
-                                <span class="text-[7.5px] text-slate-500 uppercase font-bold tracking-wider">EST. TCA</span>
-                                <span class="text-xs font-black tabular-nums tracking-wide">${timerStr}</span>
+                            <div class="col-span-1 px-2 py-1 rounded bg-slate-950 border ${isTransit ? 'border-red-500 text-red-400' : (isClose ? 'border-amber-500 text-amber-400' : 'border-slate-800 text-cyan-400')} flex flex-col items-center justify-center">
+                                <span class="text-[8px] text-slate-500 font-bold uppercase">EST. TCA</span>
+                                <span class="text-xs font-black tabular-nums">${timerStr}</span>
                             </div>
-                            <div class="col-span-2 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[9.5px]">
-                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">ALTITUDE</span><b class="tabular-nums">${plane.alt_ft.toLocaleString()} ft</b></div>
-                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">V/S RATE</span><b class="tabular-nums">${plane.vr_fpm > 0 ? '+' : ''}${plane.vr_fpm} ft/m</b></div>
-                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">SPEED</span><b class="tabular-nums">${plane.speed_kt} kt</b></div>
-                                <div><span class="text-slate-500 text-[8px] uppercase tracking-wider block">DISTANCE</span><b class="tabular-nums">${plane.distance_km} km</b></div>
+                            <div class="col-span-2 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px]">
+                                <div><span class="text-slate-500 text-[8px] uppercase block">ALT</span><b class="tabular-nums">${plane.alt_ft.toLocaleString()} ft</b></div>
+                                <div><span class="text-slate-500 text-[8px] uppercase block">V/S</span><b class="tabular-nums">${plane.vr_fpm > 0 ? '+' : ''}${plane.vr_fpm}</b></div>
+                                <div><span class="text-slate-500 text-[8px] uppercase block">SPEED</span><b class="tabular-nums">${plane.speed_kt} kt</b></div>
+                                <div><span class="text-slate-500 text-[8px] uppercase block">DIST</span><b class="tabular-nums">${plane.distance_km} km</b></div>
                             </div>
                         </div>
-
-                        <div class="flex justify-between items-center text-[9px] font-mono text-slate-400 border-t border-slate-800/60 pt-1">
+                        <div class="flex justify-between items-center text-[10px] font-mono text-slate-400 border-t border-slate-800/80 pt-1">
                             <span>HDG: <b class="text-slate-200 tabular-nums">${plane.track}°</b></span>
-                            <span>SPAN: <b class="text-slate-200 tabular-nums">${plane.wingspan_m}m</b></span>
-                            <span>ANG SIZE: <b class="text-indigo-300 tabular-nums">${target.angular_size_arcsec}"</b></span>
+                            <span>SEP: <b class="text-indigo-300 tabular-nums">${target.min_sep}°</b></span>
+                            <span>OFF: <b class="text-slate-200 tabular-nums">${target.position_descriptor}</b></span>
                         </div>
-
-                        ${(isTransit || isClose) ? renderTransitDiscDiagram(target) : ''}
                     </div>
                 `;
             });
@@ -1761,28 +1397,12 @@ HTML_TEMPLATE = r"""
             const start = [plane.lat, plane.lon];
             const tcaPos = [target.tca_lat, target.tca_lon];
 
-            if (trajectoryLine) {
-                trajectoryLine.setLatLngs([start, tcaPos]);
-            } else {
-                trajectoryLine = L.polyline([start, tcaPos], { color: '#ef4444', weight: 2.2, dashArray: '4, 6', opacity: 0.85 }).addTo(map);
-            }
+            if (trajectoryLine) trajectoryLine.setLatLngs([start, tcaPos]);
+            else trajectoryLine = L.polyline([start, tcaPos], { color: '#ef4444', weight: 2.2, dashArray: '4, 6', opacity: 0.85 }).addTo(map);
 
-            const tcaHtml = `
-                <div class="tca-target">
-                    <div class="tca-ring"></div>
-                    <div class="tca-crosshair-h"></div>
-                    <div class="tca-crosshair-v"></div>
-                    <div class="tca-core"></div>
-                </div>
-            `;
-
-            if (tcaMarker) {
-                tcaMarker.setLatLng(tcaPos);
-            } else {
-                tcaMarker = L.marker(tcaPos, {
-                    icon: L.divIcon({ className: '', html: tcaHtml, iconSize: [28, 28], iconAnchor: [14, 14] })
-                }).addTo(map);
-            }
+            const tcaHtml = `<div class="tca-target"><div class="tca-ring"></div><div class="tca-crosshair-h"></div><div class="tca-crosshair-v"></div><div class="tca-core"></div></div>`;
+            if (tcaMarker) tcaMarker.setLatLng(tcaPos);
+            else tcaMarker = L.marker(tcaPos, { icon: L.divIcon({ html: tcaHtml, iconSize: [28, 28], iconAnchor: [14, 14] }) }).addTo(map);
         }
 
         function clearTcaTrajectory() {
@@ -1799,19 +1419,17 @@ HTML_TEMPLATE = r"""
 
         document.getElementById('lead-display').innerText = (userLeadSec >= 0 ? '+' : '') + userLeadSec.toFixed(1) + 's';
         document.getElementById('obs-coords').innerText = `${observerLat.toFixed(4)}, ${observerLon.toFixed(4)}`;
-
-        // Iconos vectoriales de la Luna y Sol en la cabecera
         document.getElementById('header-moon-icon').innerHTML = getRealisticMoonSvgHtml(20);
         document.getElementById('header-sun-icon').innerHTML = getRealisticSunSvgHtml(20);
 
         updateAltitudeDisplay();
         drawRangeRings();
         setFilterMode('moon');
-        syncClock(4).then(fetchData);
+        syncClock().then(fetchData);
         fetchTerrainElevation(observerLat, observerLon);
-        setInterval(fetchData, 1500);
-        setInterval(syncClock, 20000);
-        setInterval(updateHUDCountdowns, 100);
+        setInterval(fetchData, 1800);
+        setInterval(syncClock, 30000);
+        setInterval(updateHUDCountdowns, 120);
         requestAnimationFrame(animateFrame);
     </script>
 </body>
@@ -1821,9 +1439,8 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO v27 // TIMESTAMPED ADS-B INGEST")
-    print(f" [OK] Audio & Voice Alerts: ACTIVE BY DEFAULT (Autoplay-Unlocked)")
-    print(f" [OK] Dual Elevation Controller (Manual + Auto-Detect): ACTIVE")
-    print(f" [OK] Server Online on port: {port}")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // MULTI-FEED ENGINE READY")
+    print(f" [OK] OpenSky Network & ReadsB failover: ACTIVE")
+    print(f" [OK] Serving on port: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
