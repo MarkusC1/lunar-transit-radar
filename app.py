@@ -610,7 +610,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND: CABINA TÁCTICA CON SILUETA Y PASTILLA CALLSIGN FR24
+# 5. FRONTEND: CABINA TÁCTICA CON SILUETA MINIMALISTA Y CALLSIGN FR24
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -725,7 +725,7 @@ HTML_TEMPLATE = r"""
                 <span class="font-bold text-slate-400 uppercase text-[9px] mb-0.5">FLIGHT LEVEL</span>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#ef4444]"></span> &lt; 3k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#f97316]"></span> 3k - 10k ft</div>
-                <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#eab308]"></span> 10k - 18k ft</div>
+                <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#ffd000]"></span> 10k - 18k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#22c55e]"></span> 18k - 28k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#06b6d4]"></span> 28k - 36k ft</div>
                 <div class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-[#a855f7]"></span> &gt; 36k ft</div>
@@ -1068,7 +1068,7 @@ HTML_TEMPLATE = r"""
         }
 
         // =====================================================================
-        // SILUETA FR24 EXACTA + PASTILLA CALLSIGN HORIZONTAL
+        // SILUETA AERONÁUTICA PROFESIONAL SIN MOTORES (MINIMALISTA) + CALLSIGN
         // =====================================================================
         function planeIconHtml(plane) {
             const color = getAltitudeColor(plane.alt_ft);
@@ -1094,31 +1094,36 @@ HTML_TEMPLATE = r"""
 
             return `
                 <div style="position:relative; width:32px; height:32px; display:flex; align-items:center; justify-content:center;">
-                    <!-- Avión FR24: gira con el rumbo 'track' -->
+                    <!-- Avión limpio sin motores: rota con el rumbo 'track' -->
                     <div style="width:32px; height:32px; display:flex; align-items:center; justify-content:center; transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.2s linear;">
                         <svg viewBox="0 0 32 32" width="26" height="26">
-                            <path fill="${color}" stroke="#070c18" stroke-width="0.75" stroke-linejoin="round" d="
-                                M16,2.5
-                                C16.6,2.5 17.2,3.3 17.2,5.5
-                                L17.2,11
-                                L19.5,12.5 L19.5,14.8 L21.2,14.8 L21.2,13.2
-                                L29.5,17.8 L29.8,19 L17.5,16.2
-                                L17.2,25.2
-                                L22.5,28.8 L22.5,30 L16.8,29.2
-                                L16,30.5
-                                L15.2,29.2 L9.5,30 L9.5,28.8
-                                L14.8,25.2
-                                L14.5,16.2
-                                L2.2,19 L2.5,17.8 L10.8,13.2
-                                L10.8,14.8 L12.5,14.8 L12.5,12.5
-                                L14.8,11
-                                L14.8,5.5
-                                C14.8,3.3 15.4,2.5 16,2.5 Z
+                            <path fill="${color}" stroke="#070c18" stroke-width="0.8" stroke-linejoin="round" d="
+                                M 16, 2.5
+                                C 16.6, 2.5  17.2, 3.4  17.2, 6.0
+                                L 17.2, 10.5
+                                L 29.5, 18.0
+                                L 29.5, 19.5
+                                L 17.2, 16.5
+                                L 17.0, 25.5
+                                L 22.8, 29.0
+                                L 22.8, 30.2
+                                L 16.8, 29.5
+                                L 16.0, 31.0
+                                L 15.2, 29.5
+                                L 9.2, 30.2
+                                L 9.2, 29.0
+                                L 15.0, 25.5
+                                L 14.8, 16.5
+                                L 2.5, 19.5
+                                L 2.5, 18.0
+                                L 14.8, 10.5
+                                L 14.8, 6.0
+                                C 14.8, 3.4  15.4, 2.5  16, 2.5 Z
                             "/>
                         </svg>
                     </div>
 
-                    <!-- Pastilla Callsign horizontal estilo Flightradar24 -->
+                    <!-- Pastilla Callsign horizontal fija estilo Flightradar24 -->
                     <div class="absolute left-[30px] px-1.5 py-0.5 rounded border ${labelBorder} ${labelBg} ${labelText} text-[10px] font-bold font-mono tracking-wider pointer-events-none select-none whitespace-nowrap shadow-md backdrop-blur-sm">
                         ${plane.callsign}
                     </div>
@@ -1489,7 +1494,7 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS Y LABELS FR24")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS CLEAN (SIN MOTORES)")
     print(f" [OK] Buffer de Memoria (60s hold) & Fallback: ACTIVO")
     print(f" [OK] Servidor escuchando en puerto: {port}")
     print("="*60 + "\n")
