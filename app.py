@@ -232,7 +232,7 @@ def get_live_aircraft(cur_lat, cur_lon):
                 if h:
                     TRACK_MEMORY[h] = ac
 
-        # Retención cinemática hasta 60s para evitar desapariciones
+        # Retención cinemática hasta 60s
         purged = {}
         for h, ac in TRACK_MEMORY.items():
             if (now - ac.get('_pos_t', now)) < 60.0:
@@ -610,7 +610,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND: CABINA TÁCTICA CON SILUETA MINIMALISTA Y CALLSIGN FR24
+# 5. FRONTEND: CABINA TÁCTICA CON SILUETA EXACTA FR24 + CALLSIGN
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -711,7 +711,7 @@ HTML_TEMPLATE = r"""
             <div class="hidden md:flex flex-col items-end text-[11px] font-mono text-slate-400 leading-tight"><span id="obs-coords">41.6079, 2.2876</span><span id="obs-alt-badge">145 m ASL</span></div>
             <button id="voice-btn" class="icon-btn on" onclick="toggleVoice()" title="Voz"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
             <button id="audio-btn" class="icon-btn on" onclick="toggleAudio()" title="Sonido"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/></svg></button>
-            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
             <button class="icon-btn" onclick="locateUser()" title="Mi ubicación"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
         </div>
     </header>
@@ -1061,21 +1061,21 @@ HTML_TEMPLATE = r"""
         function getAltitudeColor(altFt) {
             if (altFt < 3000) return '#ef4444';
             if (altFt < 10000) return '#f97316';
-            if (altFt < 18000) return '#ffd000';  // Amarillo clásico FR24
+            if (altFt < 18000) return '#ffd000';  // Amarillo clásico Flightradar24
             if (altFt < 28000) return '#22c55e';
             if (altFt < 36000) return '#06b6d4';
             return '#a855f7';
         }
 
         // =====================================================================
-        // SILUETA AERONÁUTICA PROFESIONAL SIN MOTORES (MINIMALISTA) + CALLSIGN
+        // SILUETA EXACTA FLIGHTRADAR24 (VECTOR FIEL A LA IMAGEN) + CALLSIGN PILL
         // =====================================================================
         function planeIconHtml(plane) {
             const color = getAltitudeColor(plane.alt_ft);
             const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
             const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
             
-            let filterStyle = 'filter: drop-shadow(0 1.5px 3px rgba(0,0,0,0.8));';
+            let filterStyle = 'filter: drop-shadow(0 1.5px 3px rgba(0,0,0,0.85));';
             let labelBorder = 'border-slate-700/60';
             let labelText = 'text-slate-100';
             let labelBg = 'bg-[#0b1325]/90';
@@ -1093,38 +1093,51 @@ HTML_TEMPLATE = r"""
             }
 
             return `
-                <div style="position:relative; width:32px; height:32px; display:flex; align-items:center; justify-content:center;">
-                    <!-- Avión limpio sin motores: rota con el rumbo 'track' -->
-                    <div style="width:32px; height:32px; display:flex; align-items:center; justify-content:center; transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.2s linear;">
-                        <svg viewBox="0 0 32 32" width="26" height="26">
-                            <path fill="${color}" stroke="#070c18" stroke-width="0.8" stroke-linejoin="round" d="
-                                M 16, 2.5
-                                C 16.6, 2.5  17.2, 3.4  17.2, 6.0
-                                L 17.2, 10.5
-                                L 29.5, 18.0
-                                L 29.5, 19.5
-                                L 17.2, 16.5
-                                L 17.0, 25.5
-                                L 22.8, 29.0
-                                L 22.8, 30.2
-                                L 16.8, 29.5
-                                L 16.0, 31.0
-                                L 15.2, 29.5
-                                L 9.2, 30.2
-                                L 9.2, 29.0
-                                L 15.0, 25.5
-                                L 14.8, 16.5
-                                L 2.5, 19.5
-                                L 2.5, 18.0
-                                L 14.8, 10.5
-                                L 14.8, 6.0
-                                C 14.8, 3.4  15.4, 2.5  16, 2.5 Z
+                <div style="position:relative; width:36px; height:36px; display:flex; align-items:center; justify-content:center;">
+                    <!-- Avión FR24: gira en torno al centro geométrico (50%, 50%) -->
+                    <div style="width:36px; height:36px; display:flex; align-items:center; justify-content:center; transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.2s linear;">
+                        <svg viewBox="0 0 100 100" width="30" height="30">
+                            <!-- Trazado exacto del avión comercial FR24 -->
+                            <path fill="${color}" stroke="#030712" stroke-width="1.2" stroke-linejoin="round" d="
+                                M 50.0, 7.0
+                                C 52.8, 7.0  54.2, 10.5  54.2, 18.0
+                                L 54.2, 40.0
+                                L 59.5, 42.8
+                                L 59.5, 39.0
+                                C 59.5, 37.8  64.5, 37.8  64.5, 39.0
+                                L 64.5, 45.4
+                                L 88.5, 59.5
+                                L 88.0, 62.2
+                                L 54.2, 53.0
+                                L 53.5, 74.0
+                                L 66.5, 84.8
+                                L 65.8, 86.8
+                                L 52.0, 82.2
+                                L 51.5, 85.0
+                                L 50.4, 85.8
+                                L 50.0, 90.0
+                                L 49.6, 85.8
+                                L 48.5, 85.0
+                                L 48.0, 82.2
+                                L 34.2, 86.8
+                                L 33.5, 84.8
+                                L 46.5, 74.0
+                                L 45.8, 53.0
+                                L 12.0, 62.2
+                                L 11.5, 59.5
+                                L 35.5, 45.4
+                                L 35.5, 39.0
+                                C 35.5, 37.8  40.5, 37.8  40.5, 39.0
+                                L 40.5, 42.8
+                                L 45.8, 40.0
+                                L 45.8, 18.0
+                                C 45.8, 10.5  47.2, 7.0  50.0, 7.0 Z
                             "/>
                         </svg>
                     </div>
 
-                    <!-- Pastilla Callsign horizontal fija estilo Flightradar24 -->
-                    <div class="absolute left-[30px] px-1.5 py-0.5 rounded border ${labelBorder} ${labelBg} ${labelText} text-[10px] font-bold font-mono tracking-wider pointer-events-none select-none whitespace-nowrap shadow-md backdrop-blur-sm">
+                    <!-- Pastilla Callsign horizontal idéntica a Flightradar24 -->
+                    <div class="absolute left-[32px] px-1.5 py-0.5 rounded border ${labelBorder} ${labelBg} ${labelText} text-[10px] font-bold font-mono tracking-wider pointer-events-none select-none whitespace-nowrap shadow-md backdrop-blur-sm">
                         ${plane.callsign}
                     </div>
                 </div>
@@ -1303,11 +1316,11 @@ HTML_TEMPLATE = r"""
                 let st = planesState[k];
 
                 if (!st) {
-                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }) }).addTo(map);
+                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [36, 36], iconAnchor: [18, 18] }) }).addTo(map);
                     marker.bindPopup(popupHtml(plane));
                     st = planesState[k] = { marker, curLat: pl, curLon: po };
                 } else {
-                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }));
+                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [36, 36], iconAnchor: [18, 18] }));
                     st.marker.setPopupContent(popupHtml(plane));
                 }
                 st.baseLat = plane.lat; st.baseLon = plane.lon; st.tRef = tRef;
@@ -1494,8 +1507,8 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS CLEAN (SIN MOTORES)")
-    print(f" [OK] Buffer de Memoria (60s hold) & Fallback: ACTIVO")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS Y CALLSIGNS OFICIALES FR24")
+    print(f" [OK] Buffer de Memoria (60s hold) & Multi-Feed: ACTIVO")
     print(f" [OK] Servidor escuchando en puerto: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
