@@ -122,7 +122,7 @@ PROVIDERS = [
     {'name': 'adsb.fi', 'type': 'readsb', 'url': 'https://opendata.adsb.fi/api/v2/lat/{lat:.4f}/lon/{lon:.4f}/dist/80', 'next_ok': 0.0},
     {'name': 'adsb.lol', 'type': 'readsb', 'url': 'https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/80', 'next_ok': 0.0},
     {'name': 'adsb.one', 'type': 'readsb', 'url': 'https://api.adsb.one/v2/point/{lat:.4f}/{lon:.4f}/80', 'next_ok': 0.0},
-    {'name': 'opensky', 'type': 'opensky', 'url': 'https://opensky-network.org/api/states/all?lamin={lamin:.4f}&lomin={lomin:.4f}&lamax={lamax:.4f}&lomax={lomax:.4f}', 'next_ok': 0.0}
+    {'name': 'opensky', 'type': 'opensky', 'url': 'https://opensky-network.org/api/states/all?lamin={lamin:.4f}&lomin={lomin:.4f}&lamax={lamin:.4f}&lomax={lomax:.4f}', 'next_ok': 0.0}
 ]
 
 TRACK_MEMORY = {}
@@ -610,7 +610,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND: CABINA TÁCTICA CON SILUETA EXACTA FR24 + CALLSIGN
+# 5. FRONTEND: CABINA TÁCTICA CON MORRO COMPACTO Y SILUETA FR24 EXACTA
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -711,7 +711,7 @@ HTML_TEMPLATE = r"""
             <div class="hidden md:flex flex-col items-end text-[11px] font-mono text-slate-400 leading-tight"><span id="obs-coords">41.6079, 2.2876</span><span id="obs-alt-badge">145 m ASL</span></div>
             <button id="voice-btn" class="icon-btn on" onclick="toggleVoice()" title="Voz"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
             <button id="audio-btn" class="icon-btn on" onclick="toggleAudio()" title="Sonido"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/></svg></button>
-            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+            <button class="icon-btn" onclick="toggleSettingsModal()" title="Ajustes"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
             <button class="icon-btn" onclick="locateUser()" title="Mi ubicación"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
         </div>
     </header>
@@ -1068,7 +1068,7 @@ HTML_TEMPLATE = r"""
         }
 
         // =====================================================================
-        // SILUETA EXACTA FLIGHTRADAR24 (VECTOR FIEL A LA IMAGEN) + CALLSIGN PILL
+        // SILUETA FR24 EXACTA: MORRO COMPACTO Y PROPORCIÓN PERFECTA
         // =====================================================================
         function planeIconHtml(plane) {
             const color = getAltitudeColor(plane.alt_ft);
@@ -1094,44 +1094,43 @@ HTML_TEMPLATE = r"""
 
             return `
                 <div style="position:relative; width:36px; height:36px; display:flex; align-items:center; justify-content:center;">
-                    <!-- Avión FR24: gira en torno al centro geométrico (50%, 50%) -->
+                    <!-- Avión FR24: Morro compacto y posición de ala realista -->
                     <div style="width:36px; height:36px; display:flex; align-items:center; justify-content:center; transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.2s linear;">
                         <svg viewBox="0 0 100 100" width="30" height="30">
-                            <!-- Trazado exacto del avión comercial FR24 -->
                             <path fill="${color}" stroke="#030712" stroke-width="1.2" stroke-linejoin="round" d="
-                                M 50.0, 7.0
-                                C 52.8, 7.0  54.2, 10.5  54.2, 18.0
-                                L 54.2, 40.0
-                                L 59.5, 42.8
-                                L 59.5, 39.0
-                                C 59.5, 37.8  64.5, 37.8  64.5, 39.0
-                                L 64.5, 45.4
-                                L 88.5, 59.5
-                                L 88.0, 62.2
-                                L 54.2, 53.0
-                                L 53.5, 74.0
-                                L 66.5, 84.8
-                                L 65.8, 86.8
-                                L 52.0, 82.2
-                                L 51.5, 85.0
-                                L 50.4, 85.8
-                                L 50.0, 90.0
-                                L 49.6, 85.8
-                                L 48.5, 85.0
-                                L 48.0, 82.2
-                                L 34.2, 86.8
-                                L 33.5, 84.8
-                                L 46.5, 74.0
-                                L 45.8, 53.0
-                                L 12.0, 62.2
-                                L 11.5, 59.5
-                                L 35.5, 45.4
-                                L 35.5, 39.0
-                                C 35.5, 37.8  40.5, 37.8  40.5, 39.0
-                                L 40.5, 42.8
-                                L 45.8, 40.0
-                                L 45.8, 18.0
-                                C 45.8, 10.5  47.2, 7.0  50.0, 7.0 Z
+                                M 50.0, 12.0
+                                C 53.2, 12.0  55.0, 16.0  55.0, 24.0
+                                L 55.0, 34.0
+                                L 60.0, 36.5
+                                L 60.0, 32.5
+                                C 60.0, 31.0  65.5, 31.0  65.5, 32.5
+                                L 65.5, 39.5
+                                L 89.0, 54.5
+                                L 88.2, 57.5
+                                L 55.0, 48.0
+                                L 54.0, 72.5
+                                L 67.5, 83.5
+                                L 66.8, 85.8
+                                L 52.0, 81.0
+                                L 51.2, 84.5
+                                L 50.4, 85.2
+                                L 50.0, 89.5
+                                L 49.6, 85.2
+                                L 48.8, 84.5
+                                L 48.0, 81.0
+                                L 33.2, 85.8
+                                L 32.5, 83.5
+                                L 46.0, 72.5
+                                L 45.0, 48.0
+                                L 11.8, 57.5
+                                L 11.0, 54.5
+                                L 34.5, 39.5
+                                L 34.5, 32.5
+                                C 34.5, 31.0  40.0, 31.0  40.0, 32.5
+                                L 40.0, 36.5
+                                L 45.0, 34.0
+                                L 45.0, 24.0
+                                C 45.0, 16.0  46.8, 12.0  50.0, 12.0 Z
                             "/>
                         </svg>
                     </div>
@@ -1507,8 +1506,8 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS Y CALLSIGNS OFICIALES FR24")
-    print(f" [OK] Buffer de Memoria (60s hold) & Multi-Feed: ACTIVO")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // SILUETAS RECALIBRADAS FR24")
+    print(f" [OK] Proporción Morro-Ala compacta & Buffer 60s: ACTIVO")
     print(f" [OK] Servidor escuchando en puerto: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
