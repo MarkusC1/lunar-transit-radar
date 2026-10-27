@@ -38,7 +38,7 @@ WINGSPANS = {
 }
 
 def get_wingspan(model_icao):
-    return WINGSPANS.get(model_icao, 35.0)
+    return WINGSPANS.get(model_icao, 35.8)
 
 def calculate_atmosphere(alt_m):
     p_mbar = 1013.25 * math.pow((1.0 - 2.25577e-5 * max(0.0, alt_m)), 5.25588)
@@ -111,11 +111,11 @@ def propagate_geodetic_position(lat_deg, lon_deg, ground_speed_ms, track_deg, dt
     return math.degrees(lat_future_r), math.degrees(lon_future_r)
 
 # =========================================================================
-# 2. INGESTA MULTI-FUENTE ADS-B CON FALLBACK GARANTIZADO
+# 2. INGESTA MULTI-FUENTE BLINDADA CON BUFFER DE MEMORIA DE VUELO
 # =========================================================================
 HTTP_HEADERS = {
-    'User-Agent': 'LunarTransitRadar/3.0 (Astronomical Observation Research Engine; OpenData)',
-    'Accept': 'application/json'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*'
 }
 
 PROVIDERS = [
@@ -125,25 +125,17 @@ PROVIDERS = [
     {'name': 'opensky', 'type': 'opensky', 'url': 'https://opensky-network.org/api/states/all?lamin={lamin:.4f}&lomin={lomin:.4f}&lamax={lamax:.4f}&lomax={lomax:.4f}', 'next_ok': 0.0}
 ]
 
-AIRCRAFT_CACHE = {
-    'lat': None,
-    'lon': None,
-    'aircraft': [],
-    'source': 'offline',
-    'timestamp': 0.0,
-    'fails': 0
-}
-_CACHE_LOCK = threading.Lock()
+TRACK_MEMORY = {}
+_TRACK_LOCK = threading.Lock()
 HTTP_SESSION = requests.Session()
 _EVENT_CACHE = {}
+LAST_PROVIDER_USED = 'online'
 
 def parse_opensky_response(data, ref_time):
     states = data.get('states') or []
     normalized = []
     for s in states:
-        if not isinstance(s, list) or len(s) < 11:
-            continue
-        if s[8]:  # on_ground == True
+        if not isinstance(s, list) or len(s) < 11 or s[8]:  # on_ground == True
             continue
         lon_val, lat_val = s[5], s[6]
         if lat_val is None or lon_val is None:
@@ -195,9 +187,9 @@ def _query_provider(provider, lat, lon):
                 lomin=lon - d_lon, lomax=lon + d_lon
             )
 
-        resp = HTTP_SESSION.get(req_url, headers=HTTP_HEADERS, timeout=(2.0, 4.0))
+        resp = HTTP_SESSION.get(req_url, headers=HTTP_HEADERS, timeout=(2.0, 3.8))
         if resp.status_code != 200:
-            provider['next_ok'] = now + (30.0 if resp.status_code in (403, 429) else 10.0)
+            provider['next_ok'] = now + (25.0 if resp.status_code in (403, 429) else 8.0)
             return None
 
         json_data = resp.json()
@@ -205,62 +197,50 @@ def _query_provider(provider, lat, lon):
             ac_list = json_data.get('ac') or json_data.get('aircraft') or []
             if not isinstance(ac_list, list):
                 return None
-            ref_now = now
             for ac in ac_list:
                 sp = float(ac.get('seen_pos', ac.get('seen', 0.0)) or 0.0)
-                ac['_pos_t'] = ref_now - max(0.0, sp)
+                ac['_pos_t'] = now - max(0.0, sp)
             return ac_list
         else:
             return parse_opensky_response(json_data, now)
 
     except Exception:
-        provider['next_ok'] = now + 12.0
+        provider['next_ok'] = now + 10.0
         return None
 
 def get_live_aircraft(cur_lat, cur_lon):
-    global AIRCRAFT_CACHE
+    global TRACK_MEMORY, LAST_PROVIDER_USED
     now = time.time()
-
-    with _CACHE_LOCK:
-        # Reutilizar caché en memoria si tiene menos de 2.5 segundos
-        if (AIRCRAFT_CACHE['timestamp'] > 0 and 
-            (now - AIRCRAFT_CACHE['timestamp']) < 2.5 and 
-            AIRCRAFT_CACHE['lat'] is not None and
-            math.hypot(cur_lat - AIRCRAFT_CACHE['lat'], cur_lon - AIRCRAFT_CACHE['lon']) < 0.15):
-            return AIRCRAFT_CACHE['aircraft'], AIRCRAFT_CACHE['source'], max(0.0, now - AIRCRAFT_CACHE['timestamp'])
-
-    # Intentar obtener datos frescos rotando proveedores disponibles
     sorted_providers = sorted(PROVIDERS, key=lambda p: p['next_ok'])
-    fresh_aircraft = None
-    winning_source = 'offline'
+    fresh_batch = None
 
     for p in sorted_providers:
         if p['next_ok'] > now:
             continue
         res = _query_provider(p, cur_lat, cur_lon)
         if res is not None and len(res) > 0:
-            fresh_aircraft = res
-            winning_source = p['name']
-            p['next_ok'] = now + 1.5  # Pausa educada
-            print(f"[ADS-B] {len(res)} aeronaves cargadas desde {winning_source}")
+            fresh_batch = res
+            LAST_PROVIDER_USED = p['name']
+            p['next_ok'] = now + 1.5
+            print(f"[ADS-B] {len(res)} aeronaves cargadas desde {LAST_PROVIDER_USED}")
             break
 
-    with _CACHE_LOCK:
-        if fresh_aircraft is not None:
-            AIRCRAFT_CACHE = {
-                'lat': cur_lat,
-                'lon': cur_lon,
-                'aircraft': fresh_aircraft,
-                'source': winning_source,
-                'timestamp': now,
-                'fails': 0
-            }
-            return fresh_aircraft, winning_source, 0.0
-        else:
-            # Fallback por Dead Reckoning: si falla la red, no borrar la pantalla
-            AIRCRAFT_CACHE['fails'] += 1
-            age = max(0.0, now - AIRCRAFT_CACHE['timestamp'])
-            return AIRCRAFT_CACHE['aircraft'], f"{AIRCRAFT_CACHE['source']} (fallback)", age
+    with _TRACK_LOCK:
+        if fresh_batch:
+            for ac in fresh_batch:
+                h = ac.get('hex') or ac.get('flight')
+                if h:
+                    TRACK_MEMORY[h] = ac
+
+        # Purgado de aeronaves únicamente si no se reciben datos tras 60 segundos
+        purged = {}
+        for h, ac in TRACK_MEMORY.items():
+            if (now - ac.get('_pos_t', now)) < 60.0:
+                purged[h] = ac
+        TRACK_MEMORY = purged
+
+        active_list = list(TRACK_MEMORY.values())
+        return active_list, LAST_PROVIDER_USED, 0.0
 
 # =========================================================================
 # 3. MOTOR ASTROMÉTRICO Y GEODÉSICO DE TRÁNSITOS
@@ -379,7 +359,7 @@ def get_data():
                 continue
 
             pos_age = max(0.0, now_epoch - ac.get('_pos_t', now_epoch))
-            if pos_age > 75.0:
+            if pos_age > 60.0:
                 continue
             total_lead = pos_age + user_lead_sec
 
@@ -631,7 +611,7 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 # =========================================================================
-# 5. FRONTEND TÁCTICO CON SILUETAS AERONÁUTICAS SIMPLIFICADAS
+# 5. FRONTEND TÁCTICO CON SILUETAS FR24 Y DIAGRAMAS COMPLETOS
 # =========================================================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -1089,21 +1069,53 @@ HTML_TEMPLATE = r"""
         }
 
         // =====================================================================
-        // SILUETA AERONÁUTICA SIMPLIFICADA (LIGERA Y DE ALTO RENDIMIENTO)
+        // SILUETAS AERONÁUTICAS PROFESIONALES ESTILO FLIGHTRADAR24 (FR24)
         // =====================================================================
         function planeIconHtml(plane) {
             const color = getAltitudeColor(plane.alt_ft);
             const anyT = (plane.moon.is_transit && moonDataGlobal.visible) || (plane.sun.is_transit && sunDataGlobal.visible);
             const anyC = (plane.moon.is_close && moonDataGlobal.visible) || (plane.sun.is_close && sunDataGlobal.visible);
-            const glow = anyT ? 'filter: drop-shadow(0 0 8px #ef4444);' : (anyC ? 'filter: drop-shadow(0 0 5px #f59e0b);' : 'filter: drop-shadow(0 1px 2px rgba(0,0,0,0.8));');
-            const lbl = (anyT || anyC) ? `<div style="position:absolute;left:28px;top:10px;white-space:nowrap;pointer-events:none;font:600 10px 'JetBrains Mono',monospace;padding:1px 5px;border-radius:4px;background:rgba(7,11,18,.9);border:1px solid ${anyT ? '#ef4444' : '#f59e0b'};color:${anyT ? '#fca5a5' : '#fcd34d'}">${plane.callsign}</div>` : '';
+            
+            let filterStyle = 'filter: drop-shadow(0 2px 4px rgba(0,0,0,0.85));';
+            let alertRing = '';
+            let labelBadge = '';
+
+            if (anyT) {
+                filterStyle = 'filter: drop-shadow(0 0 8px #ef4444) drop-shadow(0 2px 4px rgba(0,0,0,0.9));';
+                alertRing = '<div class="absolute inset-0 rounded-full border-2 border-red-500 animate-ping opacity-75 pointer-events-none"></div>';
+                labelBadge = `<div style="position:absolute;left:34px;top:8px;white-space:nowrap;pointer-events:none;font:700 10px 'JetBrains Mono',monospace;padding:1px 6px;border-radius:4px;background:rgba(15,23,42,0.95);border:1px solid #ef4444;color:#fca5a5;box-shadow:0 0 10px rgba(239,68,68,0.5)">${plane.callsign}</div>`;
+            } else if (anyC) {
+                filterStyle = 'filter: drop-shadow(0 0 6px #f59e0b) drop-shadow(0 2px 4px rgba(0,0,0,0.9));';
+                labelBadge = `<div style="position:absolute;left:34px;top:8px;white-space:nowrap;pointer-events:none;font:700 10px 'JetBrains Mono',monospace;padding:1px 6px;border-radius:4px;background:rgba(15,23,42,0.95);border:1px solid #f59e0b;color:#fcd34d">${plane.callsign}</div>`;
+            }
 
             return `
-                <div style="position:relative;width:32px;height:32px;display:flex;align-items:center;justify-content:center;">
-                    <svg viewBox="0 0 24 24" width="26" height="26" style="transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${glow};">
-                        <path fill="${color}" stroke="#030712" stroke-width="0.75" stroke-linejoin="round" d="M12 2 L13.8 8.5 L22 13.5 L22 15.5 L13.8 13.2 L13.8 19.5 L16.2 21.2 L16.2 22.5 L12 21.5 L7.8 22.5 L7.8 21.2 L10.2 19.5 L10.2 13.2 L2 15.5 L2 13.5 L10.2 8.5 Z"/>
+                <div style="position:relative;width:40px;height:40px;display:flex;align-items:center;justify-content:center;">
+                    ${alertRing}
+                    <svg viewBox="0 0 48 48" width="34" height="34" style="transform: rotate(${plane.track}deg); transform-origin: 50% 50%; ${filterStyle}; transition: transform 0.15s linear;">
+                        <!-- Silueta exacta comercial: morro, fuselaje, motores gemelos, alas en flecha con winglets y cola -->
+                        <path fill="${color}" stroke="#030712" stroke-width="1.3" stroke-linejoin="round" d="
+                            M 24 3.5
+                            C 25.2 3.5, 26.2 5.5, 26.2 11
+                            L 26.2 15
+                            L 28.6 16.5 L 28.6 20.8 L 31.4 20.8 L 31.4 17.8
+                            L 44.5 24.2 L 45.2 22.8 L 45.8 23.4 L 44.6 26.2
+                            L 26.5 22.4
+                            L 26.2 34.5
+                            L 34.8 39.8 L 34.8 41.5 L 25.6 40.8
+                            L 24 44.5
+                            L 22.4 40.8 L 13.2 41.5 L 13.2 39.8
+                            L 21.8 34.5
+                            L 21.5 22.4
+                            L 3.4 26.2 L 2.2 23.4 L 2.8 22.8 L 3.5 24.2
+                            L 16.6 17.8 L 16.6 20.8 L 19.4 20.8 L 19.4 16.5
+                            L 21.8 15
+                            L 21.8 11
+                            C 21.8 5.5, 22.8 3.5, 24 3.5 Z
+                        "/>
+                        <path d="M 24 6 L 24 13" stroke="#030712" stroke-width="0.8" opacity="0.6"/>
                     </svg>
-                    ${lbl}
+                    ${labelBadge}
                 </div>
             `;
         }
@@ -1200,6 +1212,37 @@ HTML_TEMPLATE = r"""
             </div>`;
         }
 
+        // =====================================================================
+        // DIAGRAMA DE CORTE DE CUERDA (TRÁNSITO LUNAR Y SOLAR)
+        // =====================================================================
+        function renderTransitDiscDiagram(target) {
+            const isSun = target.target === 'sun';
+            const bodyColor = isSun ? '#fbbf24' : '#38bdf8';
+            const bodyRad = isSun ? (sunDataGlobal.radius_deg || 0.26) : (moonDataGlobal.radius_deg || 0.26);
+            const normOffset = Math.max(-1.7, Math.min(1.7, target.vertical_offset_deg / Math.max(0.01, bodyRad)));
+            const chordY = 24 - (normOffset * 11);
+
+            return `
+                <div class="flex items-center gap-2.5 bg-slate-950/90 p-2 rounded-lg border border-slate-800/90 mt-1 shadow-inner font-mono">
+                    <svg width="48" height="48" viewBox="0 0 48 48" class="shrink-0 select-none">
+                        <circle cx="24" cy="24" r="22" fill="none" stroke="#1e293b" stroke-width="1"/>
+                        <circle cx="24" cy="24" r="18" fill="${isSun ? '#451a03' : '#082f49'}" stroke="${bodyColor}" stroke-width="1.4"/>
+                        <line x1="4" y1="24" x2="44" y2="24" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
+                        <line x1="24" y1="4" x2="24" y2="44" stroke="#475569" stroke-width="0.75" stroke-dasharray="2,2"/>
+                        <line x1="2" y1="${chordY.toFixed(1)}" x2="46" y2="${chordY.toFixed(1)}" stroke="${target.is_transit ? '#ef4444' : '#f59e0b'}" stroke-width="2.2" stroke-linecap="round"/>
+                    </svg>
+                    <div class="flex flex-col text-[10px] leading-tight font-mono">
+                        <div class="flex items-center gap-1">
+                            <span class="text-slate-500 uppercase font-bold tracking-wider text-[8px]">CHORD:</span>
+                            <span class="font-bold ${target.is_transit ? 'text-red-400' : 'text-amber-400'}">${target.position_descriptor}</span>
+                        </div>
+                        <span class="text-slate-400 mt-0.5">Offset: <b class="text-slate-200 tabular-nums">${target.vertical_offset_deg > 0 ? '+' : ''}${target.vertical_offset_deg}°</b> (${target.vertical_body_diams} diam.)</span>
+                        <span class="text-slate-400">Coverage: <b class="text-indigo-300 tabular-nums">${target.disk_coverage_pct}%</b> (${target.transit_duration_s}s dur.)</span>
+                    </div>
+                </div>
+            `;
+        }
+
         let fetchBusy = false;
         async function fetchData() {
             if (fetchBusy) return;
@@ -1249,11 +1292,11 @@ HTML_TEMPLATE = r"""
                 let st = planesState[k];
 
                 if (!st) {
-                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }) }).addTo(map);
+                    const marker = L.marker([pl, po], { icon: L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [40, 40], iconAnchor: [20, 20] }) }).addTo(map);
                     marker.bindPopup(popupHtml(plane));
                     st = planesState[k] = { marker, curLat: pl, curLon: po };
                 } else {
-                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [32, 32], iconAnchor: [16, 16] }));
+                    st.marker.setIcon(L.divIcon({ className: '', html: planeIconHtml(plane), iconSize: [40, 40], iconAnchor: [20, 20] }));
                     st.marker.setPopupContent(popupHtml(plane));
                 }
                 st.baseLat = plane.lat; st.baseLon = plane.lon; st.tRef = tRef;
@@ -1262,7 +1305,7 @@ HTML_TEMPLATE = r"""
             });
 
             for (const k in planesState) {
-                if (!seenKeys.has(k) && nowSec - planesState[k].lastSeen > 12.0) {
+                if (!seenKeys.has(k) && nowSec - planesState[k].lastSeen > 15.0) {
                     map.removeLayer(planesState[k].marker);
                     delete planesState[k];
                     delete tcaSmoothedEpochs[k];
@@ -1385,6 +1428,7 @@ HTML_TEMPLATE = r"""
                             <span>SEP: <b class="text-indigo-300 tabular-nums">${target.min_sep}°</b></span>
                             <span>OFF: <b class="text-slate-200 tabular-nums">${target.position_descriptor}</b></span>
                         </div>
+                        ${(isTransit || isClose) ? renderTransitDiscDiagram(target) : ''}
                     </div>
                 `;
             });
@@ -1439,8 +1483,8 @@ HTML_TEMPLATE = r"""
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "="*60)
-    print(f" [OK] LUNAR TRANSIT RADAR PRO // MULTI-FEED ENGINE READY")
-    print(f" [OK] OpenSky Network & ReadsB failover: ACTIVE")
-    print(f" [OK] Serving on port: {port}")
+    print(f" [OK] LUNAR TRANSIT RADAR PRO // BLINDADO CON FR24 ICONS")
+    print(f" [OK] Buffer de Memoria (60s hold) & Fallback: ACTIVO")
+    print(f" [OK] Servidor escuchando en puerto: {port}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=port, debug=False)
